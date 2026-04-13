@@ -8,3 +8,8 @@ bp = Blueprint("ui", __name__)
 @bp.get("/")
 def index():
     return send_from_directory(current_app.static_folder, "index.html")
+
+
+@bp.get("/login")
+def login():
+    return send_from_directory(current_app.static_folder, "login.html")

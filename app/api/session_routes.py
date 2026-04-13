@@ -77,6 +77,17 @@ def start_session():
         meta = dict(session.meta or {})
         meta["causes"] = causes
         meta["clarifier_queue"] = []
+        raw_client = body.get("client_user")
+        if isinstance(raw_client, dict):
+            safe_user = {}
+            for key in ("user_id", "display_name", "email", "mood"):
+                val = raw_client.get(key)
+                if isinstance(val, str):
+                    val = val.strip()[:240]
+                    if val:
+                        safe_user[key] = val
+            if safe_user:
+                meta["client_user"] = safe_user
         session.meta = meta
 
         session.active_domains = prefill.active_domains or activate_domains_from_causes(causes)
@@ -247,12 +258,15 @@ def next_question(session_id: str):
             current_app.logger.info("next_question: ai completed session reason=%s", reason)
             return _complete_session(session)
 
+    asked_hashes = {" ".join((q or "").strip().lower().split()) for q in asked_questions if q}
+
     followup = generate_next_followup(
         user_text=session.raw_initial_text or "",
         asked_questions=asked_questions,
         conversation_history=session.history or [],
     )
-    if followup:
+    followup_norm = " ".join((followup or "").strip().lower().split())
+    if followup and followup_norm not in asked_hashes:
         meta["current_question"] = {"type": "clarifier", "question": followup}
         meta["total_questions_asked"] = total_questions + 1
         session.meta = meta
