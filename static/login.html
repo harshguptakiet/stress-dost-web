@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Stress Dost — Sign in</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body class="login-page">
+  <div class="login-split-page">
+    <aside class="login-split-left" aria-label="About Stress Dost">
+      <div class="glass login-glass login-glass--hero">
+        <span class="login-pill">Student stress companion</span>
+        <h1 class="login-hero-title">
+          Vent it.<br />
+          <em>Understand it.</em><br />
+          Beat it.
+        </h1>
+        <p class="login-hero-copy">
+          Write or say what’s weighing on you. Stress Dost turns your stress into something you can actually work with.
+        </p>
+        <ul class="login-feature-list">
+          <li><span class="login-dot login-dot--blue"></span> AI-guided conversation flow</li>
+          <li><span class="login-dot login-dot--green"></span> Real-time stress profiling</li>
+          <li><span class="login-dot login-dot--orange"></span> Practice questions and timed drills</li>
+        </ul>
+        <div class="login-scroll-hint" aria-hidden="true">↓</div>
+      </div>
+    </aside>
+
+    <div class="login-split-divider" aria-hidden="true"></div>
+
+    <div class="login-split-right">
+      <div class="glass login-glass login-glass--form">
+        <section class="login-stage-panel is-active" id="loginStage">
+          <p class="login-right-lead">Welcome! Let’s get you started.</p>
+          <form id="loginForm" class="login-form" autocomplete="on">
+            <label for="displayName" class="label">Your name </label>
+            <input id="displayName" name="displayName" type="text" maxlength="120" placeholder="e.g Rohan" />
+
+            <label for="userId" class="label">Your id (optional)</label>
+            <input id="userId" name="userId" type="text" maxlen
+            gth="200" placeholder="Leave blank — we assign a" title="Leave blank for a random id" />
+            
+            <label for="mood" class="label">How are you feeling right now? (optional)</label>
+            <select id="mood" name="mood">
+              <option value="">— pick one —</option>
+              <option value="overwhelmed">Overwhelmed</option>
+              <option value="anxious">Anxious</option>
+              <option value="scattered">Scattered / can't focus</option>
+              <option value="burned-out">Burned out</option>
+              <option value="just-checking">Just checking in</option>
+            </select>
+
+            <div class="stage-hint" id="loginHint"></div>
+
+            <button type="submit" class="btn primary login-btn-wide">Go to Stress Dost</button>
+
+            <div class="login-or" role="presentation"><span>or</span></div>
+
+            <button type="button" class="btn ghost login-btn-wide" id="btnGuest">Continue as guest</button>
+          </form>
+        </section>
+
+        <section class="login-stage-panel" id="welcomeStage" hidden>
+          <h2 class="login-welcome-title" id="welcomeHeading">Hey there</h2>
+          <p class="login-right-lead" id="welcomeMessage">Ready to vent? The session is all yours.</p>
+          <a href="/" class="btn primary login-btn-wide">Launch Stress Dost →</a>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <script src="/auth.js"></script>
+  <script src="/login.js"></script>
+</body>
+</html>

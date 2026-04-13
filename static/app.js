@@ -37,6 +37,9 @@ const btnSkip = $("btnSkip");
 const btnReset = $("btnReset");
 const btnRestart = $("btnRestart");
 const userNameInput = $("userName");
+const btnLogout = $("btnLogout");
+const userChip = $("userChip");
+const hudUserLine = $("hudUserLine");
 
 const answerInput = $("answerInput");
 const questionStem = $("questionStem");
@@ -181,6 +184,26 @@ function setSessionUI(id, domains) {
   $("sessionId").textContent = id || "—";
   $("sessionStatus").textContent = id ? `session: ${id.slice(0, 8)}…` : "session: none";
   $("activeDomains").textContent = domains && domains.length ? domains.join(", ") : "—";
+}
+
+function syncUserUI() {
+  const u = window.StressDostAuth?.getUser?.();
+  if (userChip) {
+    userChip.textContent = u ? `${u.display_name} · ${String(u.user_id).slice(0, 8)}…` : "";
+    userChip.style.display = u ? "inline-flex" : "none";
+  }
+  if (hudUserLine) {
+    if (!u) hudUserLine.textContent = "—";
+    else hudUserLine.textContent = `${u.display_name} (${u.user_id})`;
+  }
+}
+
+function clientUserPayload() {
+  const u = window.StressDostAuth?.getUser?.();
+  if (!u) return null;
+  const out = { user_id: u.user_id, display_name: u.display_name };
+  if (u.mood) out.mood = u.mood;
+  return out;
 }
 
 function updateScoreMeta() {
@@ -743,7 +766,10 @@ async function startSessionFlow() {
     setIntroHint("");
     showStage("loading", "Absorbing your story…");
 
-    const data = await postJSON("/session/start", { text });
+    const startBody = { text };
+    const clientUser = clientUserPayload();
+    if (clientUser) startBody.client_user = clientUser;
+    const data = await postJSON("/session/start", startBody);
     log("start_session", data);
 
     setSessionUI(data.session_id, data.active_domains);
@@ -894,6 +920,10 @@ btnAnswer?.addEventListener("click", submitAnswer);
 btnSkip?.addEventListener("click", skipRemainingQuestions);
 btnRestart?.addEventListener("click", resetFlow);
 btnReset?.addEventListener("click", resetFlow);
+btnLogout?.addEventListener("click", () => {
+  window.StressDostAuth?.clearUser?.();
+  window.location.href = "/login";
+});
 btnPrevQuestion?.addEventListener("click", () => gotoQuestion(-1));
 btnNextQuestion?.addEventListener("click", () => gotoQuestion(1));
 btnReloadQuestions?.addEventListener("click", () => loadTestQuestions());
@@ -996,9 +1026,14 @@ answerInput?.addEventListener("keydown", (evt) => {
 });
 
 // Init ---------------------------------------------------------------------
-resetFlow();
-initSocket();
-setRecordButtonState();
+if (!window.StressDostAuth?.getUser?.()) {
+  window.StressDostAuth?.redirectToLogin?.();
+} else {
+  syncUserUI();
+  resetFlow();
+  initSocket();
+  setRecordButtonState();
+}
 
 // expose for console debugging
 window.__stressApp = {
@@ -1007,4 +1042,5 @@ window.__stressApp = {
   submitAnswer,
   loadTestQuestions,
   submitCurrentQuestion,
+  getUserId: () => window.StressDostAuth?.getUserId?.() ?? null,
 };
