@@ -33,6 +33,7 @@ from ..services.slot_manager import (
     set_slot_value,
 )
 from ..services.slot_prefill_llm import prefill_slots_with_llm
+from ..services.user_summary import generate_user_summary
 from ..services.relevance import combo_relevant, domain_relevant
 from ..services.stop_engine import should_stop
 
@@ -491,7 +492,23 @@ def debug_session(session_id: str):
             "popups_count": len(session.popups or []),
             "popups": session.popups or [],
             "filled_slots": session.filled_slots,
+            "user_summary": (session.meta or {}).get("user_summary") or {},
             "meta": session.meta,
+        }
+    )
+
+
+@bp.get("/<session_id>/summary")
+def session_summary(session_id: str):
+    session = get_session(session_id)
+    if not session:
+        return jsonify({"error": "session not found"}), 404
+    meta = dict(session.meta or {})
+    return jsonify(
+        {
+            "session_id": str(session.id),
+            "status": session.status,
+            "user_summary": meta.get("user_summary") or {},
         }
     )
 
@@ -554,6 +571,13 @@ def _complete_session(session):
     inferred_signals = infer_emotion_signals(stress_profile)
     stored_signals = (session.meta or {}).get("emotion_signals") or []
     emotion_signals = list(dict.fromkeys(stored_signals + inferred_signals))
+    meta["user_summary"] = generate_user_summary(
+        session.raw_initial_text or "",
+        filled_slots=session.filled_slots or {},
+        conversation_history=session.history or [],
+        emotion_signals=emotion_signals,
+    )
+    session.meta = meta
     popups = generate_popups(stress_profile, emotion_signals)
     session.popups = popups
     save_session(session)
@@ -564,5 +588,6 @@ def _complete_session(session):
             "popups_ready": True,
             "popups_count": len(session.popups or []),
             "filled_slots": session.filled_slots,
+            "user_summary": meta.get("user_summary") or {},
         }
     )

@@ -8,6 +8,7 @@ const stageEls = {
 };
 
 const logBox = $("logBox");
+const summaryBox = $("summaryBox");
 const popupConsole = $("popupConsole");
 const popupOverlay = $("popupOverlay");
 const popupQueue = [];
@@ -95,6 +96,35 @@ async function postJSON(url, body) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || data.message || `HTTP ${res.status}`);
   return data;
+}
+
+function setSummary(summary) {
+  if (!summaryBox) return;
+  if (!summary || !Object.keys(summary).length) {
+    summaryBox.textContent = "No summary yet.";
+    return;
+  }
+  const blocks = [];
+  const addRow = (label, value) => {
+    if (!value || (Array.isArray(value) && !value.length)) return;
+    const text = Array.isArray(value) ? value.join(", ") : String(value);
+    blocks.push(`
+      <div class="summary-row">
+        <div class="summary-label">${escapeHTML(label)}</div>
+        <div class="summary-value">${escapeHTML(text)}</div>
+      </div>
+    `);
+  };
+
+  addRow("User Type", summary.user_type);
+  addRow("Main Issue", summary.main_issue);
+  addRow("What Bothers Them Most", summary.what_bothers_them_most);
+  addRow("Pressure Sources", summary.pressure_sources);
+  addRow("Distraction Sources", summary.distraction_sources);
+  addRow("Negative Thought Patterns", summary.negative_thought_patterns);
+  addRow("Key Objects", summary.key_objects);
+
+  summaryBox.innerHTML = blocks.join("") || "No summary yet.";
 }
 
 async function postFormData(url, formData) {
@@ -215,6 +245,7 @@ function resetFlow() {
   setTestHint("");
   popupSummary.textContent = "We're releasing your personalized pulses now. Watch the center top.";
   popupOverlay.innerHTML = "";
+  setSummary(null);
   log("reset_flow");
   setSessionUI(null, null);
   showStage("intro");
@@ -783,6 +814,13 @@ async function handleCompletion() {
     const data = await postJSON(`/session/${sessionId}/start-simulation`, {});
     log("start_simulation", data);
     popupSummary.textContent = `Popups scheduled: ${data.popups_scheduled}. Keep an eye on the center top.`;
+    try {
+      const summaryData = await getJSON(`/session/${sessionId}/summary`);
+      setSummary(summaryData.user_summary || {});
+      log("session_summary", summaryData);
+    } catch (summaryErr) {
+      log("summary_error", summaryErr.message || String(summaryErr));
+    }
   } catch (err) {
     log("simulation_error", err.message);
     popupSummary.textContent = err.message;
