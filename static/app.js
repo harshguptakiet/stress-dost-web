@@ -9,6 +9,7 @@ const stageEls = {
 
 const logBox = $("logBox");
 const summaryBox = $("summaryBox");
+const summaryMain = $("summaryMain");
 const popupConsole = $("popupConsole");
 const popupOverlay = $("popupOverlay");
 const popupQueue = [];
@@ -99,9 +100,12 @@ async function postJSON(url, body) {
 }
 
 function setSummary(summary) {
-  if (!summaryBox) return;
+  const targets = [summaryBox, summaryMain].filter(Boolean);
+  if (!targets.length) return;
   if (!summary || !Object.keys(summary).length) {
-    summaryBox.textContent = "No summary yet.";
+    targets.forEach((target) => {
+      target.textContent = "No summary yet.";
+    });
     return;
   }
   const blocks = [];
@@ -124,7 +128,9 @@ function setSummary(summary) {
   addRow("Negative Thought Patterns", summary.negative_thought_patterns);
   addRow("Key Objects", summary.key_objects);
 
-  summaryBox.innerHTML = blocks.join("") || "No summary yet.";
+  targets.forEach((target) => {
+    target.innerHTML = blocks.join("") || "No summary yet.";
+  });
 }
 
 async function postFormData(url, formData) {
