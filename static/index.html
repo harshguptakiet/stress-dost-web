@@ -20,21 +20,33 @@
     </header>
 
     <main class="viewport">
-      <section class="stage active" id="stageIntro">
+      <section class="stage active" id="stageName">
         <div class="glass intro-card">
-          <h2>Drop every detail</h2>
-          <p>Your first dump anchors the entire journey. Type in everything that's weighing you down.</p>
+          <h2>Welcome to Stress Dost. Before we begin, what should I call you?</h2>
+          <p>This helps us personalize your experience.</p>
+          <input id="userName" type="text" placeholder="Type your name here..." />
+          <div class="row" id="nameStepRow">
+            <button id="btnNameNext" class="btn primary" type="button">Continue</button>
+          </div>
+
+          <div class="stage-hint" id="nameHint"></div>
+        </div>
+      </section>
+
+      <section class="stage" id="stageIntro">
+        <div class="glass intro-card">
+          <h2 id="storyPrompt">What's on your mind today?</h2>
           <label for="initialText" class="label">What's on your mind today?</label>
           <textarea id="initialText" rows="7" placeholder="Exams, friends, distractions, parental pressure, anything..."></textarea>
           <div class="row">
             <button id="btnRecord" class="btn ghost" type="button">Record Voice</button>
           </div>
-          <div class="suggestion-wrap" id="suggestionWrap" style="display:none;">
+          <div class="suggestion-wrap" id="suggestionWrap" hidden>
             <div class="suggestion-label">Suggestions</div>
             <div class="suggestion-list" id="suggestionList"></div>
           </div>
-          <div class="stage-hint" id="introHint"></div>
           <button id="btnStart" class="btn primary">Launch Session</button>
+          <div class="stage-hint" id="introHint"></div>
         </div>
       </section>
 
@@ -55,6 +67,7 @@
           <textarea id="answerInput" rows="4" placeholder="Type a quick, honest answer..."></textarea>
           <div class="row">
             <button id="btnAnswer" class="btn primary" disabled>Submit Answer</button>
+            <button id="btnSkip" class="btn ghost" hidden>Skip Remaining</button>
           </div>
         </div>
       </section>
@@ -70,7 +83,7 @@
                 <div class="q-count" id="questionCounter">Questions —</div>
                 <div class="q-subject" id="questionSubject">—</div>
               </div>
-              <div class="mutate-badge pill subtle" id="mutateBadge" style="display:none;">Mutated</div>
+              <div class="mutate-badge pill subtle" id="mutateBadge">Mutated</div>
               <div class="test-actions">
                 <button id="btnReloadQuestions" class="btn ghost small">Reload set</button>
                 <button id="btnSubmitQuestion" class="btn primary small">Submit</button>

@@ -1,6 +1,7 @@
 // DOM helpers --------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
 const stageEls = {
+  name: $("stageName"),
   intro: $("stageIntro"),
   loading: $("stageLoading"),
   qa: $("stageQA"),
@@ -16,7 +17,9 @@ let popupTimer = null;
 const recentPopups = new Set();
 
 const loadingTextEl = $("loadingText");
+const nameHintEl = $("nameHint");
 const introHintEl = $("introHint");
+const storyPromptEl = $("storyPrompt");
 const hintBox = $("hintBox");
 const popupSummary = $("popupSummary");
 const suggestionWrap = $("suggestionWrap");
@@ -27,10 +30,16 @@ const hudToggle = $("hudToggle");
 const btnCloseHud = $("btnCloseHud");
 
 const btnStart = $("btnStart");
+const btnNameNext = $("btnNameNext");
 const btnRecord = $("btnRecord");
 const btnAnswer = $("btnAnswer");
+const btnSkip = $("btnSkip");
 const btnReset = $("btnReset");
 const btnRestart = $("btnRestart");
+const userNameInput = $("userName");
+const btnLogout = $("btnLogout");
+const userChip = $("userChip");
+const hudUserLine = $("hudUserLine");
 
 const answerInput = $("answerInput");
 const questionStem = $("questionStem");
@@ -185,6 +194,25 @@ function setIntroHint(text) {
   }
 }
 
+function setNameHint(text) {
+  if (!nameHintEl) return;
+  nameHintEl.textContent = text || "";
+  if (text) {
+    stageEls.name?.classList.add("shake");
+    setTimeout(() => stageEls.name?.classList.remove("shake"), 400);
+  }
+}
+
+function setStoryPrompt(name) {
+  if (!storyPromptEl) return;
+  const cleanName = (name || "").trim();
+  if (!cleanName) {
+    storyPromptEl.textContent = "What's on your mind today?";
+    return;
+  }
+  storyPromptEl.textContent = `Hey ${cleanName}, what's on your mind today?`;
+}
+
 function setRecordButtonState() {
   if (!btnRecord) return;
   if (mediaRecorder && mediaRecorder.state === "recording") {
@@ -214,6 +242,26 @@ function setSessionUI(id, domains) {
   $("activeDomains").textContent = domains && domains.length ? domains.join(", ") : "—";
 }
 
+function syncUserUI() {
+  const u = window.StressDostAuth?.getUser?.();
+  if (userChip) {
+    userChip.textContent = u ? `${u.display_name} · ${String(u.user_id).slice(0, 8)}…` : "";
+    userChip.style.display = u ? "inline-flex" : "none";
+  }
+  if (hudUserLine) {
+    if (!u) hudUserLine.textContent = "—";
+    else hudUserLine.textContent = `${u.display_name} (${u.user_id})`;
+  }
+}
+
+function clientUserPayload() {
+  const u = window.StressDostAuth?.getUser?.();
+  if (!u) return null;
+  const out = { user_id: u.user_id, display_name: u.display_name };
+  if (u.mood) out.mood = u.mood;
+  return out;
+}
+
 function updateScoreMeta() {
   const totalAnswered = Object.keys(answeredMap).length;
   // ── FIX #1: Count only entries where correct === true.
@@ -228,9 +276,14 @@ function updateScoreMeta() {
 function setQuestionUI(data) {
   currentDomain = data.domain || null;
   currentSlot = data.slot || null;
+  const totalAsked = Number(data?.meta?.total_questions_asked || 0);
 
   $("qMeta").textContent = `domain: ${currentDomain || "—"} | slot: ${currentSlot || "—"}`;
   $("questionText").textContent = data.question || "Your next question will bloom here.";
+  if (btnSkip) {
+    btnSkip.hidden = totalAsked < 3;
+    btnSkip.disabled = false;
+  }
   setHint(data.hint || "");
   btnAnswer.disabled = false;
   answerInput.disabled = false;
@@ -337,7 +390,12 @@ function resetFlow() {
   resetFollowupState();
   setSuggestions([]);
   btnAnswer.disabled = true;
+  if (btnSkip) {
+    btnSkip.hidden = true;
+    btnSkip.disabled = false;
+  }
   answerInput.value = "";
+  if (userNameInput) userNameInput.value = "";
   $("initialText").value = "";
   recordedAudioBlob = null;
   recordingMimeType = "audio/webm";
@@ -352,7 +410,9 @@ function resetFlow() {
   audioChunks = [];
   setRecordButtonState();
   setHint("");
+  setNameHint("");
   setIntroHint("");
+  setStoryPrompt("");
   // Reset test question panel
   testQuestions = [];
   testQuestionIndex = 0;
@@ -370,7 +430,21 @@ function resetFlow() {
   popupSummary.textContent = "We're releasing your personalized pulses now. Watch the center top.";
   popupOverlay.innerHTML = "";
   log("reset_flow");
+  setSessionUI(null, null);
+  showStage("name");
+}
+
+function proceedFromNameStep() {
+  const name = (userNameInput?.value || "").trim();
+  if (!name) {
+    setNameHint("Please enter your name first.");
+    userNameInput?.focus();
+    return;
+  }
+  setNameHint("");
+  setStoryPrompt(name);
   showStage("intro");
+  $("initialText")?.focus();
 }
 
 async function startRecording() {
@@ -1627,12 +1701,16 @@ async function startSessionFlow() {
       showStage("intro");
       return;
     }
+
     setIntroHint("");
     // Store the initial text for passing to readiness checks later
     initialSessionText = text;
     showStage("loading", "Absorbing your story…");
 
-    const data = await postJSON("/session/start", { text });
+    const startBody = { text };
+    const clientUser = clientUserPayload();
+    if (clientUser) startBody.client_user = clientUser;
+    const data = await postJSON("/session/start", startBody);
     log("start_session", data);
 
     // ── FIX #2: setSessionUI now writes session_id to sessionStorage.
@@ -1777,6 +1855,23 @@ async function submitAnswer() {
   }
 }
 
+async function skipRemainingQuestions() {
+  if (!sessionId || !btnSkip || btnSkip.hidden || btnSkip.disabled) return;
+  try {
+    btnSkip.disabled = true;
+    btnAnswer.disabled = true;
+    showStage("loading", "Skipping remaining questions…");
+    await postJSON(`/session/${sessionId}/complete`, {});
+    await handleCompletion();
+  } catch (err) {
+    log("skip_error", err.message);
+    setHint(err.message || "Could not skip right now.");
+    btnSkip.disabled = false;
+    btnAnswer.disabled = false;
+    showStage("qa");
+  }
+}
+
 async function handleCompletion() {
   // Hide skip button — no longer relevant
   onFollowupsDone();
@@ -1805,6 +1900,13 @@ btnCloseHud?.addEventListener("click", () => toggleHud(false));
 
 // Events -------------------------------------------------------------------
 btnStart?.addEventListener("click", startSessionFlow);
+btnNameNext?.addEventListener("click", proceedFromNameStep);
+userNameInput?.addEventListener("keydown", (evt) => {
+  if (evt.key === "Enter") {
+    evt.preventDefault();
+    proceedFromNameStep();
+  }
+});
 btnRecord?.addEventListener("click", async () => {
   try {
     if (mediaRecorder && mediaRecorder.state === "recording") {
@@ -1818,8 +1920,13 @@ btnRecord?.addEventListener("click", async () => {
   }
 });
 btnAnswer?.addEventListener("click", submitAnswer);
+btnSkip?.addEventListener("click", skipRemainingQuestions);
 btnRestart?.addEventListener("click", resetFlow);
 btnReset?.addEventListener("click", resetFlow);
+btnLogout?.addEventListener("click", () => {
+  window.StressDostAuth?.clearUser?.();
+  window.location.href = "/login";
+});
 btnPrevQuestion?.addEventListener("click", () => gotoQuestion(-1));
 btnNextQuestion?.addEventListener("click", () => gotoQuestion(1));
 btnReloadQuestions?.addEventListener("click", () => loadTestQuestions());
@@ -1832,7 +1939,7 @@ function setSuggestions(items) {
   suggestionList.innerHTML = "";
   const list = Array.isArray(items) ? items.filter(Boolean) : [];
   if (!list.length) {
-    suggestionWrap.style.display = "none";
+    suggestionWrap.hidden = true;
     return;
   }
   list.forEach((text) => {
@@ -1843,7 +1950,7 @@ function setSuggestions(items) {
     pill.addEventListener("click", () => applySuggestion(text));
     suggestionList.appendChild(pill);
   });
-  suggestionWrap.style.display = "block";
+  suggestionWrap.hidden = false;
 }
 
 function applySuggestion(text) {
@@ -1944,6 +2051,14 @@ initSocket();
 setRecordButtonState();
 // Ensure skip button DOM element exists and is hidden from the start
 getOrCreateSkipBtn();
+if (!window.StressDostAuth?.getUser?.()) {
+  window.StressDostAuth?.redirectToLogin?.();
+} else {
+  syncUserUI();
+  resetFlow();
+  initSocket();
+  setRecordButtonState();
+}
 
 // expose for console debugging
 window.__stressApp = {
@@ -1958,4 +2073,6 @@ window.__stressApp = {
   getFollowupState: () => ({ followupCount, isFollowupPhase, followupsDone, FOLLOWUP_LIMIT, SKIP_BTN_AFTER }),
   // Session inspection
   getSessionId: () => sessionId,
+};
+  getUserId: () => window.StressDostAuth?.getUserId?.() ?? null,
 };

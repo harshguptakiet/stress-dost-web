@@ -50,6 +50,7 @@ from __future__ import annotations
 import json
 import logging
 import hashlib
+import re
 from .fallbacks import FALLBACK_QUESTIONS
 from .validators import is_valid_question
 from .openai_client import chat_json
@@ -159,6 +160,15 @@ Choose the right extraction based on what they said:
 IF person mentioned (friend / teacher / parent / someone):
 → "which friend — the one who's always been there, or someone you thought you could trust who turned out different?"
 → If a name was already shared in conversation_so_far — skip the name. Ask about the incident instead.
+IF user mentions a PERSON (friend, teacher, parent, someone):
+→ Ask NAME or exact identity
+    Use natural forms like:
+    - "Which friend exactly? Can you name them?" (plural/unclear)
+    - "Can you tell me your friend's name?" (single)
+
+IMPORTANT:
+- Never use the student's own name as the friend/person unless user explicitly says they are referring to themselves.
+- Do not offer choices like "<student_name> or any other friend".
 
 IF studies mentioned (exam / subject / marks / concepts):
 → "which subject — the one you've been quietly skipping, or the one that used to make sense and suddenly doesn't?"
@@ -181,6 +191,16 @@ STRICT Q1 RULES:
 - ALWAYS force specificity: ✅ "which friend — name?" ❌ "someone?"
 - NEVER force a name if no person was mentioned
 - Use THEIR word, not a synonym
+❗ STRICT RULES:
+- NEVER ask vague:
+  ❌ "someone?"
+  ❌ "one person?"
+- ALWAYS force specificity:
+    ✅ "which friend exactly? can you name them?"
+    ✅ "can you tell me your friend's name?"
+  ✅ "which subject?"
+  ✅ "what exactly?"
+- NEVER force a NAME if no person exists
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Q2 — BIFURCATE (DEEPER INTO THEIR EXPERIENCE)
@@ -571,6 +591,7 @@ def generate_counter_questions(
             if not isinstance(q, str):
                 continue
             q_clean = " ".join(q.strip().split())
+            q_clean = _strip_leading_vocative(q_clean)
             if (
                 q_clean.endswith("?")
                 and 15 <= len(q_clean) <= 400
@@ -817,6 +838,7 @@ def generate_question(
             raw      = _strip_fences(resp.choices[0].message.content or "")
             data     = json.loads(raw)
             question = " ".join((data.get("question") or "").strip().split())
+            question = _strip_leading_vocative(question)
 
             if (
                 question
@@ -982,6 +1004,24 @@ def _personal_fallback(
 
     fresh = [q for q in candidates if _hash(q) not in asked_hashes]
     return (fresh if fresh else candidates)[:3]
+
+
+def _strip_leading_vocative(text: str) -> str:
+    """Remove leading direct-name address such as 'So, Rahul, ...'."""
+    candidate = (text or "").strip()
+    if not candidate:
+        return candidate
+    patterns = [
+        r"^(?:so\s*,\s*)?[a-z][a-z'\-]{1,30}\s*,\s*(.+)$",
+        r"^(?:hey\s+)?[a-z][a-z'\-]{1,30}\s*,\s*(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, candidate, flags=re.IGNORECASE)
+        if match:
+            remainder = " ".join(match.group(1).split())
+            if remainder:
+                return remainder[0].upper() + remainder[1:]
+    return candidate
 
 
 # ============================================================================
