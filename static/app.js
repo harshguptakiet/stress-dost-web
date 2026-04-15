@@ -774,6 +774,7 @@ const StressTriggers = (() => {
     lastEnsureActiveAt: 0,
     lastTriggerActivatedAt: 0,
     lastTriggerEndedAt: 0,
+    audioPrimed: false,
   };
 
   const triggerConfig = {
@@ -869,7 +870,17 @@ const StressTriggers = (() => {
         debugLog("audio_resume_failed", e?.message || String(e));
       }
     }
+    if (ctx.state === "running") {
+      state.audioPrimed = true;
+    }
     return ctx;
+  }
+
+  function primeAudioContext() {
+    // Must run from real user interaction handlers to satisfy autoplay policies.
+    resumeAudioContextIfNeeded().catch((e) => {
+      debugLog("audio_prime_failed", e?.message || String(e));
+    });
   }
 
   function mountDevilTopBanner(lines) {
@@ -917,6 +928,9 @@ const StressTriggers = (() => {
     }
     if (kind === "scroll" || kind === "click" || kind === "keydown") {
       clearIdleVisuals();
+    }
+    if (kind === "click" || kind === "keydown" || kind === "pointerdown") {
+      primeAudioContext();
     }
   }
 
@@ -1722,46 +1736,53 @@ const StressTriggers = (() => {
       taunt: quotes[stableRange("shepardTone_quote", 0, quotes.length - 1)],
     });
 
-    let master = null;
-    let pulseTimer = null;
+    let shepardAudio = null;
     let stopped = false;
 
-    resumeAudioContextIfNeeded().then((ctx) => {
-      if (!ctx || stopped) return;
-      master = ctx.createGain();
-      master.gain.value = 0.05;
-      master.connect(ctx.destination);
+    const shepardFile = "freesound_community-mixed-rising-and-falling-shepard-tone-83747.mp3";
+    const shepardSources = [
+      new URL(`/static/${shepardFile}`, window.location.href).toString(),
+      new URL(`static/${shepardFile}`, window.location.href).toString(),
+      new URL(shepardFile, window.location.href).toString(),
+    ];
 
-      const spawnPulse = () => {
+    (async () => {
+      for (const src of shepardSources) {
         if (stopped) return;
-        const base = 140 + stableRange("shepardTone_base", 0, 70);
-        [0, 12, 24].forEach((semi, idx) => {
-          const osc = ctx.createOscillator();
-          const gain = ctx.createGain();
-          osc.type = idx % 2 === 0 ? "sine" : "triangle";
-          osc.frequency.value = base * Math.pow(2, semi / 12);
-          gain.gain.value = 0.0001;
-          osc.connect(gain);
-          gain.connect(master);
-          const now = ctx.currentTime;
-          gain.gain.exponentialRampToValueAtTime(0.018 - idx * 0.004, now + 0.28);
-          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.9);
-          osc.start(now);
-          osc.stop(now + 0.92);
-        });
-      };
-
-      spawnPulse();
-      pulseTimer = setInterval(spawnPulse, 720);
-    });
+        try {
+          const candidate = new Audio(src);
+          candidate.loop = true;
+          candidate.preload = "auto";
+          candidate.volume = 1;
+          const playPromise = candidate.play();
+          if (playPromise && typeof playPromise.then === "function") {
+            await playPromise;
+          }
+          if (stopped) {
+            candidate.pause();
+            candidate.currentTime = 0;
+            return;
+          }
+          shepardAudio = candidate;
+          return;
+        } catch (err) {
+          debugLog("audio_unavailable", `shepardTone:mp3_source_failed:${src}:${String(err)}`);
+        }
+      }
+      debugLog("audio_unavailable", "shepardTone:mp3_all_sources_failed");
+    })();
 
     return {
       durationMs: stableRange("shepardTone_duration", 8000, 13000),
       cleanup: () => {
         stopped = true;
-        if (pulseTimer) clearInterval(pulseTimer);
         try {
-          master?.disconnect();
+          if (shepardAudio) {
+            shepardAudio.pause();
+            shepardAudio.currentTime = 0;
+            shepardAudio.src = "";
+            shepardAudio.load();
+          }
         } catch (e) {
           // no-op
         }
