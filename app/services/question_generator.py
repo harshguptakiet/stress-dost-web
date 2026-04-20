@@ -1,52 +1,79 @@
+
+from __future__ import annotations
+
+def _extract_person_names_from_history(conversation_history: list[dict]) -> dict[str, str]:
+     """
+     Extracts mapping of relation keywords (e.g., 'friend', 'teacher') to names from conversation history.
+     Returns a dict: {relation: name}
+     """
+     relation_tokens = {
+          "friend", "friends", "teacher", "sir", "maam", "mam", "parent", "parents",
+          "mother", "father", "mom", "dad", "brother", "sister", "classmate", "roommate",
+          "boyfriend", "girlfriend", "partner", "cousin", "person", "someone",
+          "wife", "husband", "relative", "uncle", "aunt",
+     }
+     person_map = {}
+     for turn in conversation_history:
+          if turn.get("role") != "user":
+                continue
+          text = (turn.get("text") or turn.get("content") or "").strip()
+          tokens = re.findall(r"[A-Za-z][A-Za-z'\-]*", text)
+          for idx in range(len(tokens) - 1):
+                rel = tokens[idx].lower()
+                nxt = tokens[idx + 1]
+                if rel in relation_tokens and nxt and nxt[0].isupper():
+                     # Only store first occurrence for each relation
+                     if rel not in person_map:
+                          person_map[rel] = nxt
+     return person_map
+
 """Question generation - Truly Personal, Never Generic, Never Repeated.
 
 Every question feels like it came from a real person who heard exactly
 what the student said — not a bot running a checklist.
 
 Core techniques used for every single response:
-    ECHO       → Mirror their exact word back, split into two possibilities
-    BIFURCATE  → Give two specific options so they can't stay vague
-    NAME IT    → Say the thing they didn't say but probably meant
+     ECHO       → Mirror their exact word back, split into two possibilities
+     BIFURCATE  → Give two specific options so they can't stay vague
+     NAME IT    → Say the thing they didn't say but probably meant
 
 No keyword buckets. No hardcoded question sets. GPT handles everything.
 Fallback is a last resort and still uses the same 3 techniques.
 
 Changes vs previous version:
-    1. Added FOLLOWUP_LIMIT = 3 constant — generate_next_followup() now
-       enforces a hard cap of 3 follow-ups per session. Returns None once
-       the cap is reached, signalling the caller to stop.
-    2. Added should_show_skip_button(followup_count) — returns True when
-       followup_count >= 2 so the frontend can show the "Skip" button.
-    3. Added get_followup_count() / increment_followup_count() /
-       reset_followup_count() helpers that operate on a lightweight
-       in-process runtime store keyed by session_id.  Follow-up counts
-       are intentionally NOT persisted to DB or CSV — they live only in
-       process memory for the duration of the session.
-    4. generate_next_followup() now accepts an optional followup_count
-       parameter.  If the count >= FOLLOWUP_LIMIT it returns None
-       immediately without calling GPT.
-    5. ai_ready_to_complete() result is now respected inside
-       generate_next_followup(): if the model says ready=True AND we have
-       at least 1 follow-up under our belt, the function returns None to
-       stop the loop.
-    6. _personal_fallback tuple unpack was swapped (keyword vs echo_word).
-       Original unpacked as (echo_word, option_a, option_b, named_truth, keyword)
-       but tuples are defined as (keyword, echo_word, option_a, option_b, named_truth).
-       This caused the wrong word to be echoed back on every fallback call.
-    7. Markdown fence stripper replaced with a shared _strip_fences() helper
-       that correctly handles ```json, ```, and inline fence variants.
-       The old raw.split("```")[1] approach left trailing ``` in the string
-       and crashed json.loads on any response without a newline after the fence.
-    8. generate_next_followup now uses its own lean single-question prompt
-       (SYSTEM_PROMPT_SINGLE_FOLLOWUP) instead of calling generate_counter_questions
-       with num_questions=1. The old approach wasted ~500 tokens per call
-       generating 3 questions and discarding 2.
-    9. Slot prompt injection hardened: switched from {slot}/{domain} placeholders
-       (which break if .format() is ever called on the string) to __SLOT__/__DOMAIN__
-       sentinels replaced via plain .replace(). Injection is now in _build_slot_prompt().
+     1. Added FOLLOWUP_LIMIT = 3 constant — generate_next_followup() now
+         enforces a hard cap of 3 follow-ups per session. Returns None once
+         the cap is reached, signalling the caller to stop.
+     2. Added should_show_skip_button(followup_count) — returns True when
+         followup_count >= 2 so the frontend can show the "Skip" button.
+     3. Added get_followup_count() / increment_followup_count() /
+         reset_followup_count() helpers that operate on a lightweight
+         in-process runtime store keyed by session_id.  Follow-up counts
+         are intentionally NOT persisted to DB or CSV — they live only in
+         process memory for the duration of the session.
+     4. generate_next_followup() now accepts an optional followup_count
+         parameter.  If the count >= FOLLOWUP_LIMIT it returns None
+         immediately without calling GPT.
+     5. ai_ready_to_complete() result is now respected inside
+         generate_next_followup(): if the model says ready=True AND we have
+         at least 1 follow-up under our belt, the function returns None to
+         stop the loop.
+     6. _personal_fallback tuple unpack was swapped (keyword vs echo_word).
+         Original unpacked as (echo_word, option_a, option_b, named_truth, keyword)
+         but tuples are defined as (keyword, echo_word, option_a, option_b, named_truth).
+         This caused the wrong word to be echoed back on every fallback call.
+     7. Markdown fence stripper replaced with a shared _strip_fences() helper
+         that correctly handles ```json, ```, and inline fence variants.
+         The old raw.split("```")[1] approach left trailing ``` in the string
+         and crashed json.loads on any response without a newline after the fence.
+     8. generate_next_followup now uses its own lean single-question prompt
+         (SYSTEM_PROMPT_SINGLE_FOLLOWUP) instead of calling generate_counter_questions
+         with num_questions=1. The old approach wasted ~500 tokens per call
+         generating 3 questions and discarding 2.
+     9. Slot prompt injection hardened: switched from {slot}/{domain} placeholders
+         (which break if .format() is ever called on the string) to __SLOT__/__DOMAIN__
+         sentinels replaced via plain .replace(). Injection is now in _build_slot_prompt().
 """
-from __future__ import annotations
-
 import json
 import logging
 import hashlib
@@ -593,12 +620,26 @@ def _has_explicit_person_name(text: str) -> bool:
     return False
 
 
-def _needs_name_followup(latest_user_text: str, previous_user_texts: list[str]) -> bool:
-    """Return True when a person is mentioned but no explicit name is known yet."""
+def _needs_name_followup(latest_user_text: str, previous_user_texts: list[str], conversation_history: list[dict] = None) -> bool:
+    """Return True when a person is mentioned but no explicit name is known yet for that relation."""
     if not _mentions_person(latest_user_text):
         return False
     if _has_explicit_person_name(latest_user_text):
         return False
+    # New logic: check if the referenced relation already has a name in conversation history
+    if conversation_history is not None:
+        person_map = _extract_person_names_from_history(conversation_history)
+        # Find which relation is being referenced in latest_user_text
+        relation_tokens = set(_PERSON_KEYWORDS)
+        tokens = re.findall(r"[A-Za-z][A-Za-z'\-]*", latest_user_text)
+        for idx in range(len(tokens) - 1):
+            rel = tokens[idx].lower()
+            if rel in relation_tokens:
+                if rel in person_map:
+                    return False  # Name already known for this relation
+                else:
+                    return True   # Name not yet known for this relation
+    # Fallback: old logic
     return not any(_has_explicit_person_name(text) for text in previous_user_texts)
 
 
@@ -808,6 +849,7 @@ def generate_next_followup(
     enforce_name_followup = _needs_name_followup(
         latest_user_text=text,
         previous_user_texts=already_known[:-1],
+        conversation_history=conversation_history,
     )
     logger.debug(
         "generate_next_followup: enforce_name_followup=%s latest_user_text=%r",
@@ -1265,7 +1307,16 @@ def _personal_fallback(
             ]
 
     fresh = [q for q in candidates if _hash(q) not in asked_hashes]
-    return (fresh if fresh else candidates)[:3]
+    result = (fresh if fresh else candidates)[:3]
+
+    # Always append name requirement if teacher/friend/family is mentioned and not already asked
+    person_keywords = [r"teacher", r"sir", r"maam", r"mam", r"friend", r"friends", r"mother", r"father", r"mom", r"dad", r"parent", r"parents", r"brother", r"sister", r"cousin"]
+    if any(re.search(rf"\\b{kw}\\b", text_lower) for kw in person_keywords):
+        # Only append if none of the questions already ask for a name
+        for i, q in enumerate(result):
+            if not _question_asks_for_name(q):
+                result[i] = _append_name_requirement(q, user_text)
+    return result
 
 
 def _strip_leading_vocative(text: str) -> str:
