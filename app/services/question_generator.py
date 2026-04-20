@@ -311,7 +311,7 @@ No preamble. No explanation. No markdown. Just the JSON object.
 
 SYSTEM_PROMPT_SINGLE_FOLLOWUP = """
 You are talking to a JEE/NEET student mid-conversation.
-You are their sharp, direct older sibling — not a therapist, not a bot.
+You ask like a thoughtful therapist in simple student language: warm, clear, relatable, and easy to answer.
 
 You are given:
 - student_said: what they just said
@@ -320,18 +320,25 @@ You are given:
 - student_answers_so_far: the student's own previous answers
 
 YOUR ONLY JOB:
-Generate EXACTLY 1 follow-up question that goes one layer deeper than what they just said.
+Generate EXACTLY 1 follow-up question that goes one layer deeper than what they just said and helps identify a concrete weak point.
 
 RULES:
 - Scan conversation_so_far and student_answers_so_far first.
   If a slot (name / subject / app / number) was already answered — do NOT ask for it again.
 - Use their EXACT words, not synonyms.
-- Apply ONE of these techniques:
-    ECHO + BIFURCATE: give two real, specific, emotionally loaded options
-    NAME IT: say the uncomfortable truth they haven't said yet
-- 15–50 words. Ends with "?".
-- NEVER start with "I understand", "That must be", "Tell me more".
-- NEVER repeat anything in already_asked.
+- Match the student's language style:
+        if input is English, ask in English;
+        if input is Hinglish, ask in simple Hinglish.
+- Avoid mixing language unnecessarily in one question.
+- Ask about ONE actionable weak-point dimension at a time:
+        trigger, study habit, concentration drop, time-planning gap, confidence dip, avoidance pattern, social pressure impact, or recovery strategy.
+- Keep it specific enough that the answer is concrete (person, subject, app, chapter, time-window, event, or behavior).
+- Keep the tone friendly and human; the question should feel personally relevant.
+- Prefer one gentle reflective twist that makes the student pause and think, without sounding scary or too personal.
+- If a person is involved, keep relational context and identity clarity in the same follow-up.
+- 9–18 words. Ends with "?".
+- Avoid generic prompts like "tell me more" and avoid repeating anything in already_asked.
+- Use short, plain words. Avoid long or heavy sentence structures.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT (STRICT JSON — NO EXCEPTIONS)
@@ -353,7 +360,7 @@ No preamble. No explanation. No markdown. Just the JSON object.
 _SYSTEM_PROMPT_SLOT_QUESTION_TEMPLATE = """
 You generate ONE follow-up question to extract the slot "__SLOT__" in the "__DOMAIN__" context.
 
-You are the student's sharp, direct older sibling — not a form, not a bot, not a therapist.
+You ask in a therapist-like tone that is simple, friendly, and personal.
 You already know something about their situation. This question digs for one specific piece.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -518,6 +525,127 @@ def _strip_fences(raw: str) -> str:
     return "\n".join(lines).strip()
 
 
+_PERSON_KEYWORDS = (
+    "friend",
+    "friends",
+    "teacher",
+    "sir",
+    "maam",
+    "mam",
+    "parent",
+    "parents",
+    "mother",
+    "father",
+    "mom",
+    "dad",
+    "brother",
+    "sister",
+    "classmate",
+    "roommate",
+    "boyfriend",
+    "girlfriend",
+    "partner",
+    "cousin",
+    "person",
+    "someone",
+    "wife",
+    "husband",
+    "relative",
+    "uncle",
+    "aunt",
+
+)
+
+
+def _mentions_person(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(re.search(rf"\b{re.escape(token)}\b", lowered) for token in _PERSON_KEYWORDS)
+
+
+def _has_explicit_person_name(text: str) -> bool:
+    """Heuristic for explicit related-person name disclosures in user text."""
+    raw_text = (text or "")
+    lowered = raw_text.lower()
+    relation = r"(?:friend|teacher|sir|maam|mam|parent|parents|mother|father|mom|dad|brother|sister|classmate|roommate|boyfriend|girlfriend|partner|cousin|person|someone)"
+    # Relationship-scoped patterns only. Intentionally avoid generic
+    # "my name is ..." so the student's own name does not suppress
+    # person-name followup questions.
+    patterns = [
+        rf"\b{relation}\b[^.?!\n]{{0,35}}\b(?:name\s+is|named|called)\s+[a-z][a-z'\-]{{1,30}}\b",
+    ]
+    if any(re.search(pattern, lowered) for pattern in patterns):
+        return True
+
+    # Compact explicit-name forms with capitalization, e.g. "friend Rahul".
+    # Token-based matching avoids false positives like
+    # "friend compare karta hai" being treated as a name.
+    relation_tokens = {
+        "friend", "friends", "teacher", "sir", "maam", "mam", "parent", "parents",
+        "mother", "father", "mom", "dad", "brother", "sister", "classmate", "roommate",
+        "boyfriend", "girlfriend", "partner", "cousin", "person", "someone",
+    }
+    tokens = re.findall(r"[A-Za-z][A-Za-z'\-]*", raw_text)
+    for idx in range(len(tokens) - 1):
+        if tokens[idx].lower() in relation_tokens:
+            nxt = tokens[idx + 1]
+            if nxt and nxt[0].isupper():
+                return True
+    return False
+
+
+def _needs_name_followup(latest_user_text: str, previous_user_texts: list[str]) -> bool:
+    """Return True when a person is mentioned but no explicit name is known yet."""
+    if not _mentions_person(latest_user_text):
+        return False
+    if _has_explicit_person_name(latest_user_text):
+        return False
+    return not any(_has_explicit_person_name(text) for text in previous_user_texts)
+
+
+def _question_asks_for_name(question: str) -> bool:
+    q = (question or "").lower()
+    return bool(re.search(r"\bname\b", q))
+
+
+def _build_name_followup_question(latest_user_text: str) -> str:
+    lowered = (latest_user_text or "").lower()
+    if re.search(r"\bfriends\b", lowered):
+        return "Which friend exactly are you talking about and what is their name?"
+    if re.search(r"\bfriend\b", lowered):
+        return "Which friend exactly are you talking about and what is their name?"
+    if re.search(r"\bteacher\b|\bsir\b|\bmaam\b|\bmam\b", lowered):
+        return "Which teacher exactly are you talking about and what is their name?"
+    if re.search(r"\bmother\b|\bfather\b|\bmom\b|\bdad\b|\bparent\b|\bparents\b", lowered):
+        return "Which family member are you talking about and what is their name?"
+    return "Who exactly are you talking about and what is this person's name?"
+
+
+def _append_name_requirement(question: str, latest_user_text: str) -> str:
+    """Keep contextual depth and append name clarification in the same follow-up."""
+    base = " ".join((question or "").strip().split())
+    if not base:
+        return _build_name_followup_question(latest_user_text)
+    if _question_asks_for_name(base):
+        return base
+
+    # Keep this as a single follow-up question while forcing person identity capture.
+    # Keep suffix short so combined question stays under validator word limits.
+    lowered = (latest_user_text or "").lower()
+    if re.search(r"\bteacher\b|\bsir\b|\bmaam\b|\bmam\b", lowered):
+        name_suffix = "which teacher is this by name"
+    elif re.search(r"\bmother\b|\bfather\b|\bmom\b|\bdad\b|\bparent\b|\bparents\b|\bbrother\b|\bsister\b|\bcousin\b", lowered):
+        name_suffix = "which family member is this by name"
+    elif re.search(r"\bfriends\b|\bfriend\b", lowered):
+        name_suffix = "which friend is this by name"
+    else:
+        name_suffix = "who is this person by name"
+
+    if base.endswith("?"):
+        base = base[:-1].rstrip()
+    combined = f"{base} and {name_suffix}?"
+    return combined
+
+
 # ============================================================================
 # MAIN — 3-QUESTION GENERATION
 # ============================================================================
@@ -620,8 +748,7 @@ def generate_counter_questions(
 # KEY CHANGES:
 #   • Accepts followup_count to enforce FOLLOWUP_LIMIT.
 #   • Returns None (stop signal) if limit reached.
-#   • Checks ai_ready_to_complete() and returns None if model says ready=True
-#     AND at least 1 follow-up has already been asked.
+#   • Skips ai_ready_to_complete() in this hot path to reduce latency.
 #   • Does NOT persist the count — caller must call increment_followup_count()
 #     after a question is successfully delivered to the frontend.
 # ============================================================================
@@ -639,8 +766,6 @@ def generate_next_followup(
 
     Returns None when:
       • followup_count has reached FOLLOWUP_LIMIT (hard cap = 3)
-      • The AI readiness detector says we already have enough signal
-        AND at least 1 follow-up has been asked
 
     The caller is responsible for:
       1. Calling increment_followup_count(session_id) after delivering the question.
@@ -655,7 +780,7 @@ def generate_next_followup(
         conversation_history: Full chat history as [{"role":..., "text":...}]
         followup_count:       How many follow-ups have been asked so far.
                               Pass get_followup_count(session_id) here.
-        initial_text:         The student's original opening message (for readiness check).
+        initial_text:         The student's original opening message.
         session_id:           Session identifier — used only for logging, not storage.
     """
     # ── Hard cap ──────────────────────────────────────────────────────────────
@@ -665,28 +790,6 @@ def generate_next_followup(
             followup_count, FOLLOWUP_LIMIT, session_id or "?",
         )
         return None
-
-    # ── AI readiness check (only if at least 2 follow-ups already done) ──────
-    # We skip this on the first two follow-ups (count < 2) so the student
-    # always gets at least two follow-up questions before we can stop early.
-    # This matches SKIP_BUTTON_AFTER = 2 and ensures the skip button has a
-    # chance to appear before the backend stops generating follow-ups.
-    if followup_count >= 2:
-        try:
-            ready, reason = ai_ready_to_complete(
-                initial_text=initial_text or user_text,
-                conversation_history=conversation_history,
-                asked_questions=asked_questions,
-            )
-            if ready:
-                logger.info(
-                    "generate_next_followup: AI says ready — stopping. reason=%r session=%s",
-                    reason, session_id or "?",
-                )
-                return None
-        except Exception as exc:
-            # Readiness check failure is non-fatal — continue generating
-            logger.warning("generate_next_followup: readiness check failed: %s", exc)
 
     text = (user_text or "").strip()
     if not text:
@@ -702,6 +805,16 @@ def generate_next_followup(
         if role == "user" and content:
             already_known.append(content)
 
+    enforce_name_followup = _needs_name_followup(
+        latest_user_text=text,
+        previous_user_texts=already_known[:-1],
+    )
+    logger.debug(
+        "generate_next_followup: enforce_name_followup=%s latest_user_text=%r",
+        enforce_name_followup,
+        text[:120],
+    )
+
     payload = {
         "student_said":           text[:1500],
         "already_asked":          asked_questions,
@@ -716,8 +829,9 @@ def generate_next_followup(
             model="gpt-4o-mini",
             system=SYSTEM_PROMPT_SINGLE_FOLLOWUP,
             user=json.dumps(payload, ensure_ascii=False),
-            max_tokens=200,
-            temperature=0.9,
+            max_tokens=140,
+            temperature=0.7,
+            timeout=8,
         )
         raw      = _strip_fences(resp.choices[0].message.content or "")
         data     = json.loads(raw)
@@ -730,25 +844,32 @@ def generate_next_followup(
             and _hash(question) not in asked_hashes
             and is_valid_question(question)
         ):
+            if enforce_name_followup and not _question_asks_for_name(question):
+                merged = _append_name_requirement(question, text)
+                if _hash(merged) not in asked_hashes and is_valid_question(merged):
+                    logger.info("generate_next_followup: appending name requirement to contextual followup")
+                    question = merged
+
             logger.debug(
                 "generate_next_followup: lean prompt returned valid question (count=%d)",
                 followup_count,
             )
             return question
 
-        logger.warning("generate_next_followup: GPT question failed validation — falling back")
+        logger.warning("generate_next_followup: GPT question failed validation — using local fallback")
 
     except Exception as exc:
         logger.warning("generate_next_followup GPT call failed: %s", exc)
 
-    # Hard fallback — reuse the 3-question path and take the first result
-    questions = generate_counter_questions(
-        user_text=text,
-        num_questions=1,
-        asked_questions=asked_questions,
-        conversation_history=conversation_history,
-    )
-    return questions[0] if questions else None
+    # Fast local fallback: avoid a second network roundtrip in this hot path.
+    fallback_questions = _personal_fallback(text, asked_questions)
+    fallback = fallback_questions[0] if fallback_questions else None
+    if fallback and enforce_name_followup and not _question_asks_for_name(fallback):
+        merged = _append_name_requirement(fallback, text)
+        if _hash(merged) not in asked_hashes and is_valid_question(merged):
+            logger.info("generate_next_followup: appending name requirement to fallback followup")
+            return merged
+    return fallback
 
 
 # ============================================================================
@@ -940,6 +1061,132 @@ def _personal_fallback(
     asked_hashes    = {_hash(q) for q in asked_questions}
     text_lower      = user_text.lower()
 
+    def _has_any(tokens: list[str]) -> bool:
+        return any(token in text_lower for token in tokens)
+
+    def _is_hinglish_input() -> bool:
+        hinglish_markers = [
+            "mujhe", "mera", "meri", "hai", "nahi", "nhi", "kyu", "kyun", "kaise",
+            "padh", "padha", "samajh", "yaar", "bahut", "bohot", "thoda", "zyada",
+            "dost", "bekar", "nind", "neend", "soch", "lagta", "hota", "hoti",
+        ]
+        return _has_any(hinglish_markers)
+
+    is_hinglish = _is_hinglish_input()
+
+    # Quick, relatable cue-based fallback for Hinglish/common student phrasing.
+    if _has_any(["friend", "dost", "compare", "comparison", "log kya", "judge"]):
+        if is_hinglish:
+            candidates = [
+                "Jab woh compare karta hai, zyada hurt kis baat se hota hai?",
+                "Yeh issue daily hota hai, ya kisi specific moment me trigger hota hai?",
+                "Abhi tumhe zyada need support ki hai ya clear boundary ki?",
+            ]
+        else:
+            candidates = [
+                "When comparison happens, what hurts more: their words or your self-doubt?",
+                "Does this happen daily, or after specific situations?",
+                "Right now, do you need support, or firmer boundaries?",
+            ]
+        fresh = [q for q in candidates if _hash(q) not in asked_hashes]
+        return (fresh if fresh else candidates)[:3]
+
+    if _has_any(["phone", "reel", "reels", "scroll", "instagram", "yt", "youtube", "shorts", "game", "gaming"]):
+        if is_hinglish:
+            candidates = [
+                "Phone uthate hi tum kya feel karte ho: relief, boredom, ya stress se bachna?",
+                "Distraction start kab hota hai: study start se pehle, ya beech me?",
+                "Agar 1 habit fix karni ho, phone timing pe kaunsi ek change possible hai?",
+            ]
+        else:
+            candidates = [
+                "When you pick your phone, is it relief, boredom, or stress escape?",
+                "Does distraction begin before study, or during study?",
+                "If you fix one phone habit this week, what can you change first?",
+            ]
+        fresh = [q for q in candidates if _hash(q) not in asked_hashes]
+        return (fresh if fresh else candidates)[:3]
+
+    if _has_any(["start", "starting", "procrast", "delay", "consisten", "routine", "revision"]):
+        if is_hinglish:
+            candidates = [
+                "Start karne me sabse bada block kya hota hai: mood, fear, ya distraction?",
+                "Routine tootne ka main point kya hai: timing, energy, ya consistency?",
+                "Kal se start karne ke liye ek chhota workable step kya ho sakta hai?",
+            ]
+        else:
+            candidates = [
+                "What blocks your start most: mood, fear, or distraction?",
+                "Where does your routine break most: timing, energy, or consistency?",
+                "What is one small workable step to restart tomorrow?",
+            ]
+        fresh = [q for q in candidates if _hash(q) not in asked_hashes]
+        return (fresh if fresh else candidates)[:3]
+
+    if _has_any(["confidence", "self doubt", "wrong question", "mistake", "blunder"]):
+        if is_hinglish:
+            candidates = [
+                "Confidence drop hone ke turant baad pehla thought kya aata hai?",
+                "Ek galti ke baad tum pace slow karte ho, ya overthink karne lagte ho?",
+                "Confidence recover karne ke liye abhi kya sabse helpful rahega?",
+            ]
+        else:
+            candidates = [
+                "After confidence drops, what is your first thought?",
+                "After one mistake, do you slow down, or start overthinking?",
+                "What helps you recover confidence fastest right now?",
+            ]
+        fresh = [q for q in candidates if _hash(q) not in asked_hashes]
+        return (fresh if fresh else candidates)[:3]
+
+    if _has_any(["anx", "anxiety", "panic", "mock", "before test", "test se pehle"]):
+        if is_hinglish:
+            candidates = [
+                "Mock test se pehle anxiety ka trigger kya hota hai?",
+                "Anxiety zyada body me feel hoti hai, ya thoughts me?",
+                "Test se pehle calm hone ke liye kaunsa step workable lagta hai?",
+            ]
+        else:
+            candidates = [
+                "Before mock tests, what usually triggers your anxiety most?",
+                "Does anxiety show up more in your body, or in your thoughts?",
+                "What pre-test step feels realistic to calm you right now?",
+            ]
+        fresh = [q for q in candidates if _hash(q) not in asked_hashes]
+        return (fresh if fresh else candidates)[:3]
+
+    if _has_any(["math", "physics", "chem", "chapter", "test", "exam", "mock", "blank", "focus", "concentrat", "padh", "study"]):
+        if is_hinglish:
+            candidates = [
+                "Padhte waqt sabse pehle kya break hota hai: focus, confidence, ya pace?",
+                "Yeh problem zyada kis subject ya topic me dikhti hai?",
+                "Agle 2 din me isko easy banane ke liye ek realistic step kya ho sakta hai?",
+            ]
+        else:
+            candidates = [
+                "While studying, what breaks first: focus, confidence, or pace?",
+                "Which subject or topic shows this issue most often?",
+                "What is one realistic step for the next two days?",
+            ]
+        fresh = [q for q in candidates if _hash(q) not in asked_hashes]
+        return (fresh if fresh else candidates)[:3]
+
+    if _has_any(["stress", "tension", "anx", "anxiety", "pressure", "overwhelm", "panic", "overthink", "confidence", "sleep", "neend", "nind", "result"]):
+        if is_hinglish:
+            candidates = [
+                "Stress peak pe kab hota hai: study start se pehle, ya result sochte waqt?",
+                "Is pressure ka main source abhi kya lag raha hai?",
+                "Abhi tumhe zyada help kis me chahiye: plan, focus, ya emotional reset?",
+            ]
+        else:
+            candidates = [
+                "When stress peaks, is it before study, or while thinking about results?",
+                "What feels like the main pressure source right now?",
+                "What helps more right now: a clear plan, better focus, or emotional reset?",
+            ]
+        fresh = [q for q in candidates if _hash(q) not in asked_hashes]
+        return (fresh if fresh else candidates)[:3]
+
     # Each tuple: (keyword, echo_word, option_a, option_b, named_truth)
     #   keyword     — word searched for in student text
     #   echo_word   — word echoed back in Q1
@@ -977,30 +1224,39 @@ def _personal_fallback(
 
     if matched:
         keyword, echo_word, option_a, option_b, named_truth = matched
-        candidates = [
-            # Q1 — ECHO
-            f"{echo_word.capitalize()} like {option_a}, or {echo_word} like {option_b}?",
-            # Q2 — BIFURCATE
-            "Is this something that hit you suddenly, or has it been quietly building for a while without you saying it out loud?",
-            # Q3 — NAME IT
-            f"Is it that {named_truth}?",
-            # Depth extras — used if the first 3 were already asked
-            "What's the one specific thing that, if it changed tomorrow, would actually make a difference here?",
-            "Who around you right now actually knows how heavy this has gotten — or are you carrying it alone?",
-        ]
+        if is_hinglish:
+            candidates = [
+                f"Jab tum {echo_word} bolte ho, yeh zyada pehle aata hai ya study ke beech?",
+                "Yeh issue start me aata hai, ya focus drop hone ke baad?",
+                "Abhi weakest kya lag raha hai: planning, focus, confidence, ya sleep?",
+                "Recent kaunsa moment is feeling ko sabse strong bana gaya?",
+                "Is week ek chhota step kya hai jo help kar sakta hai?",
+            ]
+        else:
+            candidates = [
+                f"When you say {echo_word}, does it rise before study or during study?",
+                "Does this issue start early, or after focus drops?",
+                "What feels weakest right now: planning, focus, confidence, or sleep?",
+                "Which recent moment made this feeling strongest?",
+                "What is one small step this week that may help most?",
+            ]
     else:
-        # Pure unknown input — still personal, still uses techniques
-        candidates = [
-            # Q1 — ECHO on the situation itself
-            "When you say this — is it something that hit you all at once, or something you've been sitting with for a while?",
-            # Q2 — BIFURCATE
-            "Is it more about how you're feeling inside, or something specific that happened with someone around you?",
-            # Q3 — NAME IT
-            "What's the part of this you haven't actually said out loud yet — the thing sitting underneath what you just told me?",
-            # Depth
-            "If you had to put one word on the main thing weighing on you right now, what would it be?",
-            "Is there a specific moment you keep going back to — the one where it started feeling like this?",
-        ]
+        if is_hinglish:
+            candidates = [
+                "Main issue kya lag raha hai: time pressure, focus break, confidence drop, ya outside pressure?",
+                "Jab issue badhta hai, pehle kya start hota hai: overthinking, avoidance, distraction, ya low energy?",
+                "Routine ka weakest part kya hai: start time, consistency, revision, ya review?",
+                "Recent kis event ne is issue ko heavy feel karaya?",
+                "Agar yeh week better ho, routine me pehla change kya dikhega?",
+            ]
+        else:
+            candidates = [
+                "What feels like the main issue: time pressure, focus breaks, confidence drop, or outside pressure?",
+                "When this gets worse, what starts first: overthinking, avoidance, distraction, or low energy?",
+                "Which routine part is weakest now: start time, consistency, revision, or review?",
+                "Which recent event made this issue feel heavier?",
+                "If this improves this week, what changes first in your routine?",
+            ]
 
     fresh = [q for q in candidates if _hash(q) not in asked_hashes]
     return (fresh if fresh else candidates)[:3]

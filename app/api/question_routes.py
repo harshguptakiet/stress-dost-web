@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover
     _CERTIFI_PATH = None
 
 from ..services.question_mutator import mutate_question
+from ..realtime.scheduler import is_popup_simulation_active
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +498,23 @@ def get_stats():
 @question_bp.route("/mutate/<question_id>", methods=["POST"])
 def mutate(question_id: str):
     """Mutate a question (scq/integer) by changing numeric values and answers."""
+    body = request.get_json(force=True, silent=True) or {}
+    session_id = str(body.get("session_id") or "").strip()
+    if is_popup_simulation_active(session_id or None):
+        logger.info(
+            "mutate_endpoint skipped question_id=%s reason=popup_simulation_active session_id=%s",
+            question_id,
+            session_id or "*",
+        )
+        return jsonify(
+            {
+                "status": "success",
+                "mutated": False,
+                "skipped": True,
+                "reason": "popup_simulation_active",
+            }
+        )
+
     raw_question = acadza_fetcher.fetch_question(question_id)
     if not raw_question:
         return (

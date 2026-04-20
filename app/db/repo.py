@@ -20,6 +20,21 @@ def create_session(raw_initial_text: str) -> Session:
             "binary_answers": [],
             "emotion_signals": [],
             "combo_history": [],
+            "trigger_feedback": {
+                "recent_triggers": [],
+                "effectiveness": {},
+                "baseline_stats": {
+                    "count": 0,
+                    "sum_time": 0.0,
+                    "sum_confidence": 0.0,
+                    "sum_accuracy": 0.0,
+                },
+                "baseline_metrics": {
+                    "time_spent": 0.0,
+                    "confidence": 0.0,
+                    "accuracy": 0.0,
+                },
+            },
         },
     )
     db.session.add(session)

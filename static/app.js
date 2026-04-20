@@ -10,18 +10,12 @@ const stageEls = {
 };
 
 const logBox = $("logBox");
-const summaryBox = $("summaryBox");
-const summaryMain = $("summaryMain");
-const binaryHistory = $("binaryHistory");
 const popupConsole = $("popupConsole");
 const popupOverlay = $("popupOverlay");
-const binaryOverlay = $("binaryOverlay");
-const binaryQuestionEl = $("binaryQuestion");
-const btnBinaryA = $("btnBinaryA");
-const btnBinaryB = $("btnBinaryB");
 const popupQueue = [];
 let popupActive = false;
 let popupTimer = null;
+let popupSuppressionTimer = null;
 const recentPopups = new Set();
 
 const loadingTextEl = $("loadingText");
@@ -86,14 +80,12 @@ let mediaStream = null;
 let audioChunks = [];
 let recordedAudioBlob = null;
 let recordingMimeType = "audio/webm";
-let binaryPromptTimer = null;
-let binaryPromptVisible = false;
-let binaryPromptBusy = false;
 let testQuestions = [];
 let testQuestionIndex = 0;
 let selectedOptions = {};
 let answeredMap = {};
 let mutationTimers = [];
+let mutationPaused = false;
 let integerKeypadListenerAttached = false;
 let suggestTimer = null;
 const disableStressMode = false;
@@ -344,72 +336,35 @@ async function getJSON(url) {
   return data;
 }
 
-async function postJSON(url, body) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body || {}),
-  });
+async function postJSON(url, body, options) {
+  const timeoutMs = Number(options?.timeoutMs || 0);
+  const controller =
+    timeoutMs > 0 && typeof AbortController !== "undefined"
+      ? new AbortController()
+      : null;
+  let timeoutId = null;
+  if (controller && timeoutMs > 0) {
+    timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  }
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+      signal: controller?.signal,
+    });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error(`Request timeout after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || data.message || `HTTP ${res.status}`);
   return data;
-}
-
-function setSummary(summary) {
-  const targets = [summaryBox, summaryMain].filter(Boolean);
-  if (!targets.length) return;
-  if (!summary || !Object.keys(summary).length) {
-    targets.forEach((target) => {
-      target.textContent = "No summary yet.";
-    });
-    return;
-  }
-  const blocks = [];
-  const addRow = (label, value) => {
-    if (!value || (Array.isArray(value) && !value.length)) return;
-    const text = Array.isArray(value) ? value.join(", ") : String(value);
-    blocks.push(`
-      <div class="summary-row">
-        <div class="summary-label">${escapeHTML(label)}</div>
-        <div class="summary-value">${escapeHTML(text)}</div>
-      </div>
-    `);
-  };
-
-  addRow("User Type", summary.user_type);
-  addRow("Main Issue", summary.main_issue);
-  addRow("What Bothers Them Most", summary.what_bothers_them_most);
-  addRow("Pressure Sources", summary.pressure_sources);
-  addRow("Distraction Sources", summary.distraction_sources);
-  addRow("Negative Thought Patterns", summary.negative_thought_patterns);
-  addRow("Key Objects", summary.key_objects);
-
-  targets.forEach((target) => {
-    target.innerHTML = blocks.join("") || "No summary yet.";
-  });
-}
-
-function setBinaryHistory(items) {
-  if (!binaryHistory) return;
-  const rows = Array.isArray(items) ? items.filter(Boolean) : [];
-  if (!rows.length) {
-    binaryHistory.textContent = "No A/B answers yet.";
-    return;
-  }
-  binaryHistory.innerHTML = rows
-    .map((item, index) => {
-      const selected = String(item.selected || "").toUpperCase();
-      const selectedText =
-        selected === "A" ? item.a || item.selected_text : selected === "B" ? item.b || item.selected_text : item.selected_text;
-      return `
-        <div class="binary-history-row">
-          <div class="binary-history-index">#${index + 1}</div>
-          <div class="binary-history-question">${escapeHTML(item.question || "")}</div>
-          <div class="binary-history-answer">${escapeHTML(selected)}. ${escapeHTML(selectedText || "")}</div>
-        </div>
-      `;
-    })
-    .join("");
 }
 
 async function postFormData(url, formData) {
@@ -422,77 +377,15 @@ async function postFormData(url, formData) {
   return data;
 }
 
-function hideBinaryPrompt() {
-  if (!binaryOverlay) return;
-  binaryOverlay.classList.remove("active");
-  binaryOverlay.setAttribute("aria-hidden", "true");
-  binaryPromptVisible = false;
-}
-
-function renderBinaryPrompt(data) {
-  if (!binaryOverlay || !binaryQuestionEl || !btnBinaryA || !btnBinaryB) return;
-  binaryQuestionEl.textContent = data.question || "Choose one.";
-  btnBinaryA.textContent = `A. ${data.a || "Option A"}`;
-  btnBinaryB.textContent = `B. ${data.b || "Option B"}`;
-  btnBinaryA.disabled = false;
-  btnBinaryB.disabled = false;
-  binaryOverlay.classList.add("active");
-  binaryOverlay.setAttribute("aria-hidden", "false");
-  binaryPromptVisible = true;
-}
-
-function stopBinaryPromptLoop() {
-  if (binaryPromptTimer) {
-    clearInterval(binaryPromptTimer);
-    binaryPromptTimer = null;
-  }
-  hideBinaryPrompt();
-}
-
-async function fetchBinaryPrompt() {
-  if (!sessionId || binaryPromptVisible || binaryPromptBusy) return;
-  if (!stageEls.popups?.classList.contains("active")) return;
-  binaryPromptBusy = true;
-  try {
-    const data = await postJSON(`/session/${sessionId}/binary-question`, {});
-    log("binary_question", data);
-    if (data && data.question && data.a && data.b) {
-      renderBinaryPrompt(data);
-    }
-  } catch (err) {
-    log("binary_question_error", err.message || String(err));
-  } finally {
-    binaryPromptBusy = false;
-  }
-}
-
-function startBinaryPromptLoop() {
-  stopBinaryPromptLoop();
-  binaryPromptTimer = setInterval(fetchBinaryPrompt, 20000);
-}
-
-async function submitBinaryPrompt(choice) {
-  if (!sessionId || !binaryPromptVisible) return;
-  btnBinaryA.disabled = true;
-  btnBinaryB.disabled = true;
-  try {
-    const data = await postJSON(`/session/${sessionId}/binary-answer`, { selected: choice });
-    log("binary_answer", data);
-    if (data && data.stored) {
-      const existing = Array.isArray(window.__binaryAnswers) ? window.__binaryAnswers.slice() : [];
-      existing.push(data.stored);
-      window.__binaryAnswers = existing;
-      setBinaryHistory(existing);
-    }
-    hideBinaryPrompt();
-  } catch (err) {
-    log("binary_answer_error", err.message || String(err));
-    btnBinaryA.disabled = false;
-    btnBinaryB.disabled = false;
-  }
-}
-
 function showStage(name, message) {
+  // Pause non-critical mutation traffic while popup stress stage is active.
+  setMutationPaused(name === "popups");
+  if (name !== "popups") {
+    popupQueue.length = 0;
+    popupActive = false;
+    clearTimeout(popupTimer);
+    if (popupOverlay) popupOverlay.innerHTML = "";
+  }
   Object.values(stageEls).forEach((el) => el?.classList.remove("active"));
   const stage = stageEls[name];
   if (stage) stage.classList.add("active");
@@ -632,7 +525,6 @@ function resetFlow() {
   }
   mediaRecorder = null;
   audioChunks = [];
-  stopBinaryPromptLoop();
   setRecordButtonState();
   setHint("");
   setNameHint("");
@@ -658,9 +550,6 @@ function resetFlow() {
   setTestHint("");
   popupSummary.textContent = "We're releasing your personalized pulses now. Watch the center top.";
   popupOverlay.innerHTML = "";
-  setSummary(null);
-  window.__binaryAnswers = [];
-  setBinaryHistory([]);
   log("reset_flow");
   setSessionUI(null, null);
   showStage("name");
@@ -857,6 +746,18 @@ function clearMutationTimers() {
   mutationTimers = [];
 }
 
+function setMutationPaused(paused) {
+  const next = Boolean(paused);
+  if (mutationPaused === next) return;
+  mutationPaused = next;
+  if (mutationPaused) {
+    clearMutationTimers();
+    log("mutation_paused", "popups_stage_active");
+  } else {
+    log("mutation_resumed", "popups_stage_inactive");
+  }
+}
+
 function cloneClientFallbackQuestions() {
   return CLIENT_FALLBACK_QUESTIONS.map((q, idx) => ({
     ...q,
@@ -870,20 +771,23 @@ const StressTriggers = (() => {
   const reducedMotion = Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const AI_TRIGGER_ENDPOINT = "/api/triggers/recommend";
   const AI_DECISION_MIN_GAP_MS = 700;
-  const AI_DECISION_TIMEOUT_MS = 4500;
-  const AI_DECISION_TIMEOUT_FAST_MS = 1400;
-  const TRIGGER_COOLDOWN_FACTOR = 0.5;
-  const MIN_COOLDOWN_MS = 2200;
-  const KEEPALIVE_GAP_MS = 2400;
-  const LONG_HESITATION_THRESHOLD_MS = 12000;
-  const LONG_HESITATION_REPEAT_GAP_MS = 14000;
-  const POST_ANSWER_RANDOM_TRIGGER_PROB = 0.33;
+  const AI_DECISION_DEBOUNCE_MS = 320;
+  const AI_DECISION_TIMEOUT_MS = 8000;
+  const AI_DECISION_TIMEOUT_FAST_MS = 5000;
+  const AI_DECISION_ERROR_BACKOFF_MS = 2200;
+  const TRIGGER_COOLDOWN_FACTOR = 0.35;
+  const MIN_COOLDOWN_MS = 1400;
+  const FEEDBACK_MIN_INTERVAL_MS = 60000;
+  const FEEDBACK_PROMPT_MAX_OPEN_MS = 18000;
+  const SCREEN_QUIET_BREAK_MS = 1600;
+  const STRESS_BUDGET_MAX = 100;
+  const STRESS_BUDGET_MIN_COST = 8;
+  const TRIGGER_COST_BY_INTENSITY = { low: 8, medium: 15, high: 25 };
   const active = new Map();
   const cooldownUntil = new Map();
   const activationCounts = new Map();
   const devButtons = new Map();
   let audioContext = null;
-  let passiveMonitorTimer = null;
   const state = {
     stage: "name",
     examStartedAt: 0,
@@ -908,15 +812,257 @@ const StressTriggers = (() => {
     correctStreak: 0,
     aiDecisionInFlight: false,
     lastAIDecisionAt: 0,
+    aiBackoffUntil: 0,
+    aiDebounceTimer: null,
+    noActionStreak: 0,
     recentTriggerNames: [],
-    serialTriggerCursor: 0,
+    recentTriggerOutcomes: [],
     queuedTriggerRequest: null,
-    lastLongHesitationTriggerAt: 0,
-    lastEnsureActiveAt: 0,
     lastTriggerActivatedAt: 0,
     lastTriggerEndedAt: 0,
     audioPrimed: false,
+    lastAnswerWasCorrect: null,
+    stressBudget: STRESS_BUDGET_MAX,
+    interactionHesitationMs: 0,
+    interactionHesitationStartedAt: 0,
+    pointerPressureSamples: [],
+    deviceMovementIndex: 0,
+    lastAgitationEventAt: 0,
+    lastContextSwitchAt: 0,
+    lastRapidTapEventAt: 0,
+    interruptionLocks: {},
+    feedbackLastShownAt: 0,
+    feedbackPromptOpen: false,
+    feedbackResponseHistory: [],
+    feedbackDifficultyPreference: "medium",
+    feedbackTopicPreference: "",
+    lastFeedbackQuestionType: "",
+    feedbackInterestReelTimer: null,
+    feedbackInterestHardDeadlineTimer: null,
+    feedbackInterestReelDeadlineAt: 0,
+    screenQuietUntil: 0,
+    newsReelHistory: [],
+    lastNewsTopic: "",
+    lastNewsImage: "",
   };
+
+  const FEEDBACK_PROMPT_LIBRARY = {
+    stressed: [
+      "How are you feeling right now under this pressure?",
+      "Quick check: is the stress manageable or heavy right now?",
+      "Before next question, how intense is the pressure for you?",
+    ],
+    anxious: [
+      "How is your mind feeling right now: calm or overactive?",
+      "Are you feeling clear, shaky, or stuck right now?",
+      "Quick pulse: is anxiety low, medium, or high right now?",
+    ],
+    focused: [
+      "You look steady. How do you feel right now?",
+      "Quick check-in: still focused, or mentally drifting?",
+      "How is your energy right now: stable or fading?",
+    ],
+    confident: [
+      "Nice momentum. How are you feeling now?",
+      "Quick pulse: confident, neutral, or unsure right now?",
+      "How is your state right now after recent questions?",
+    ],
+  };
+
+  const FEEDBACK_OPTIONS_BY_MOOD = {
+    stressed: ["Stressed", "Overwhelmed", "Calm now", "Need a short pause"],
+    anxious: ["Anxious", "Confused", "Okay", "Focused"],
+    focused: ["Focused", "Slightly tired", "Distracted", "Confident"],
+    confident: ["Confident", "Excited", "Calm", "Need challenge"],
+  };
+
+  const FEEDBACK_DIFFICULTY_OPTIONS = ["Easy", "Medium", "Hard"];
+  const FEEDBACK_TOPIC_OPTIONS = ["Movies", "News", "Games", "Music", "Sports", "Technology", "Science", "Health", "Other"];
+
+  const INTEREST_TOPIC_MAP = {
+    movies: "movies",
+    movie: "movies",
+    news: "world",
+    world: "world",
+    games: "games",
+    game: "games",
+    gaming: "games",
+    music: "music",
+    sports: "sports",
+    sport: "sports",
+    technology: "technology",
+    tech: "technology",
+    science: "science",
+    health: "health",
+    other: "world",
+  };
+
+  function mapFeedbackTopicToReelTopic(value) {
+    const key = String(value || "").trim().toLowerCase();
+    if (!key) return "";
+    return INTEREST_TOPIC_MAP[key] || "";
+  }
+
+  function applyFeedbackIntensityBias(baseIntensity) {
+    const order = ["low", "medium", "high"];
+    const current = String(baseIntensity || "medium").toLowerCase();
+    const baseIdx = Math.max(0, order.indexOf(current));
+    const pref = String(state.feedbackDifficultyPreference || "medium").toLowerCase();
+    let delta = 0;
+    if (pref === "hard") delta = 1;
+    else if (pref === "easy") delta = -1;
+    const nextIdx = Math.max(0, Math.min(order.length - 1, baseIdx + delta));
+    return order[nextIdx];
+  }
+
+  function clearInterestReelSchedule() {
+    if (state.feedbackInterestReelTimer) {
+      clearTimeout(state.feedbackInterestReelTimer);
+      state.feedbackInterestReelTimer = null;
+    }
+    if (state.feedbackInterestHardDeadlineTimer) {
+      clearTimeout(state.feedbackInterestHardDeadlineTimer);
+      state.feedbackInterestHardDeadlineTimer = null;
+    }
+    state.feedbackInterestReelDeadlineAt = 0;
+  }
+
+  function scheduleInterestReelTrigger(preferredTopic) {
+    const mappedTopic = mapFeedbackTopicToReelTopic(preferredTopic);
+    if (!mappedTopic) return;
+
+    clearInterestReelSchedule();
+    state.feedbackTopicPreference = mappedTopic;
+
+    const startedAt = Date.now();
+    const maxWindowMs = 15000;
+    const initialDelayMs = 1000 + Math.floor(Math.random() * 14000);
+    state.feedbackInterestReelDeadlineAt = startedAt + maxWindowMs;
+
+    const forceMandatoryAtDeadline = () => {
+      if (state.stage !== "popups") {
+        clearInterestReelSchedule();
+        return;
+      }
+
+      if (active.size > 0) {
+        deactivateAllTriggers();
+      }
+      state.screenQuietUntil = 0;
+
+      const activated = activateTrigger("bollywoodReelTrap", {
+        userState: currentUserState(),
+        force: true,
+        reason: `mandatory_feedback_interest:${mappedTopic}`,
+        intensity: applyFeedbackIntensityBias("low"),
+        timeoutMs: 0,
+      });
+
+      if (activated) {
+        clearInterestReelSchedule();
+        return;
+      }
+
+      // One immediate final retry if something raced at the deadline tick.
+      state.feedbackInterestReelTimer = setTimeout(() => {
+        if (state.stage !== "popups") {
+          clearInterestReelSchedule();
+          return;
+        }
+        if (active.size > 0) {
+          deactivateAllTriggers();
+        }
+        state.screenQuietUntil = 0;
+        activateTrigger("bollywoodReelTrap", {
+          userState: currentUserState(),
+          force: true,
+          reason: `mandatory_feedback_interest_retry:${mappedTopic}`,
+          intensity: applyFeedbackIntensityBias("low"),
+          timeoutMs: 0,
+        });
+        clearInterestReelSchedule();
+      }, 180);
+    };
+
+    state.feedbackInterestHardDeadlineTimer = setTimeout(forceMandatoryAtDeadline, maxWindowMs);
+
+    const attemptActivate = (forceFallback = false) => {
+      if (state.stage !== "popups") {
+        clearInterestReelSchedule();
+        return;
+      }
+
+      const userState = currentUserState();
+      const context = {
+        userState,
+        force: Boolean(forceFallback),
+        reason: `feedback_interest:${mappedTopic}`,
+        intensity: applyFeedbackIntensityBias("low"),
+        timeoutMs: 0,
+      };
+
+      if (active.size === 0) {
+        const activated = activateTrigger("bollywoodReelTrap", context);
+        if (activated) {
+          clearInterestReelSchedule();
+          return;
+        }
+      }
+
+      const now = Date.now();
+      if (now >= Number(state.feedbackInterestReelDeadlineAt || 0)) {
+        if (!forceFallback && active.size === 0) {
+          // Final attempt allows bypass of repeat/cooldown gates.
+          attemptActivate(true);
+        } else {
+          clearInterestReelSchedule();
+        }
+        return;
+      }
+
+      const retryDelay = 500 + Math.floor(Math.random() * 1100);
+      state.feedbackInterestReelTimer = setTimeout(() => attemptActivate(false), retryDelay);
+    };
+
+    state.feedbackInterestReelTimer = setTimeout(() => attemptActivate(false), initialDelayMs);
+  }
+
+  function buildFeedbackSurvey(mood, reason, promptOverride) {
+    const moodPrompt = String(promptOverride || "").trim() || selectFeedbackPrompt(mood);
+    const surveys = [
+      {
+        kind: "mood",
+        eyebrow: "Quick check-in",
+        prompt: moodPrompt,
+        options: FEEDBACK_OPTIONS_BY_MOOD[mood] || FEEDBACK_OPTIONS_BY_MOOD.focused,
+      },
+      {
+        kind: "difficulty",
+        eyebrow: "Difficulty tuning",
+        prompt: "How does the test feel right now?",
+        options: FEEDBACK_DIFFICULTY_OPTIONS,
+      },
+      {
+        kind: "topic",
+        eyebrow: "Content preference",
+        prompt: "Which topic are you most interested in right now?",
+        options: FEEDBACK_TOPIC_OPTIONS,
+      },
+    ];
+
+    const filtered = surveys.filter((item) => item.kind !== state.lastFeedbackQuestionType);
+    const pool = filtered.length ? filtered : surveys;
+
+    // Ask topic/difficulty slightly more often after entering test to personalize quickly.
+    if ((reason === "question_rendered" || reason === "enter_popups") && Math.random() < 0.65) {
+      const preferredKinds = pool.filter((item) => item.kind === "topic" || item.kind === "difficulty");
+      if (preferredKinds.length) {
+        return preferredKinds[Math.floor(Math.random() * preferredKinds.length)];
+      }
+    }
+
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
 
   const triggerConfig = {
     optionShuffle: { conflicts: [], cooldown: [18000, 26000] },
@@ -940,28 +1086,6 @@ const StressTriggers = (() => {
     bollywoodReelTrap: { conflicts: ["blackout", "fakeCrashScreen"], cooldown: [32000, 52000] },
   };
 
-  const serialTriggerOrder = [
-    "optionShuffle",
-    "phantomCompetitor",
-    "stressTimer",
-    "confidenceBreaker",
-    "mirageHighlight",
-    "spatialTicking",
-    "fakeMentorCount",
-    "hesitationHeatmap",
-    "heartbeatVibration",
-    "colorInversion",
-    "waveDistortion",
-    "bollywoodReelTrap",
-    "fakeLowBattery",
-    "chaosBackground",
-    "screenFlip",
-    "shepardTone",
-    "blurAttack",
-    "fakeCrashScreen",
-    "blackout",
-  ];
-
   function debugLog(kind, detail) {
     if (!stressDebug) return;
     log(`stress_${kind}`, detail || "");
@@ -984,12 +1108,151 @@ const StressTriggers = (() => {
     return min + (hash % span);
   }
 
+  function getPlatform() {
+    const ua = (navigator.userAgent || "").toLowerCase();
+    return ua.includes("android") ? "android" : "web";
+  }
+
+  function getElapsedSeconds() {
+    if (!state.examStartedAt) return 0;
+    return Math.max(0, Math.floor((Date.now() - state.examStartedAt) / 1000));
+  }
+
+  function phaseRank(phase) {
+    const ranks = {
+      baseline: 0,
+      escalation: 1,
+      crucible: 2,
+      final_sprint: 3,
+    };
+    return ranks[String(phase || "baseline")] ?? 0;
+  }
+
+  function phaseByRank(rank) {
+    if (rank >= 3) return "final_sprint";
+    if (rank >= 2) return "crucible";
+    if (rank >= 1) return "escalation";
+    return "baseline";
+  }
+
+  function getTestPhase() {
+    const elapsed = getElapsedSeconds();
+    const elapsedPhase =
+      elapsed <= 90
+        ? "baseline"
+        : elapsed <= 300
+          ? "escalation"
+          : elapsed <= 600
+            ? "crucible"
+            : "final_sprint";
+
+    // Fast-answering users can advance phases by progress, not only wall-clock time.
+    const submissions = Number(state.totalSubmissions || 0);
+    const progressPhase =
+      submissions <= 2
+        ? "baseline"
+        : submissions <= 8
+          ? "escalation"
+          : submissions <= 16
+            ? "crucible"
+            : "final_sprint";
+
+    return phaseByRank(Math.max(phaseRank(elapsedPhase), phaseRank(progressPhase)));
+  }
+
+  function clampBudget(value) {
+    return Math.max(0, Math.min(STRESS_BUDGET_MAX, Math.round(Number(value) || 0)));
+  }
+
+  function addBudget(points) {
+    state.stressBudget = clampBudget(state.stressBudget + Number(points || 0));
+  }
+
+  function consumeBudgetForIntensity(intensity) {
+    const cost = TRIGGER_COST_BY_INTENSITY[String(intensity || "medium").toLowerCase()] || TRIGGER_COST_BY_INTENSITY.medium;
+    addBudget(-cost);
+    return cost;
+  }
+
+  function getRecentAccuracy() {
+    const rows = Object.values(answeredMap || {});
+    if (!rows.length) return 0.5;
+    const correct = rows.filter((row) => Boolean(row?.correct)).length;
+    return Math.max(0, Math.min(1, correct / rows.length));
+  }
+
+  function getAvgTouchPressure() {
+    const samples = state.pointerPressureSamples;
+    if (!samples.length) return null;
+    const sum = samples.reduce((acc, val) => acc + Number(val || 0), 0);
+    return Math.max(0, Math.min(1, sum / samples.length));
+  }
+
+  function capturePointerPressure(evt) {
+    const pressure = Number(evt?.pressure);
+    if (!Number.isFinite(pressure)) return;
+    if (pressure <= 0) return;
+    state.pointerPressureSamples.push(pressure);
+    if (state.pointerPressureSamples.length > 25) {
+      state.pointerPressureSamples = state.pointerPressureSamples.slice(-25);
+    }
+  }
+
+  function updateDeviceMovement(magnitude) {
+    if (!Number.isFinite(magnitude)) return;
+    const clamped = Math.max(0, Math.min(10, magnitude));
+    state.deviceMovementIndex = Math.round((state.deviceMovementIndex * 0.75) + (clamped * 0.25));
+  }
+
   function getAppShell() {
     return document.querySelector(".app-shell");
   }
 
   function getTestCard() {
     return document.getElementById("testCard");
+  }
+
+  function isInterruptionActive() {
+    return Object.keys(state.interruptionLocks || {}).length > 0;
+  }
+
+  function acquireInterruptionLock(source) {
+    const key = String(source || "interruption");
+    state.interruptionLocks[key] = (state.interruptionLocks[key] || 0) + 1;
+
+    if (state.aiDebounceTimer) {
+      clearTimeout(state.aiDebounceTimer);
+      state.aiDebounceTimer = null;
+    }
+    state.queuedTriggerRequest = null;
+    deactivateAllTriggers();
+
+    if (popupTimer) {
+      clearTimeout(popupTimer);
+      popupTimer = null;
+    }
+    popupActive = false;
+    if (popupOverlay) popupOverlay.innerHTML = "";
+  }
+
+  function releaseInterruptionLock(source) {
+    const key = String(source || "interruption");
+    const current = Number(state.interruptionLocks[key] || 0);
+    if (current <= 1) delete state.interruptionLocks[key];
+    else state.interruptionLocks[key] = current - 1;
+
+    if (!isInterruptionActive() && state.stage === "popups") {
+      state.screenQuietUntil = Date.now() + SCREEN_QUIET_BREAK_MS;
+      processPopupQueue();
+    }
+  }
+
+  function isInQuietBreak() {
+    return Date.now() < Number(state.screenQuietUntil || 0);
+  }
+
+  function isScreenBusyForPopup() {
+    return isInterruptionActive() || active.size > 0 || isInQuietBreak();
   }
 
   function getOrCreateAudioContext() {
@@ -1055,17 +1318,27 @@ const StressTriggers = (() => {
   function setStage(name) {
     state.stage = name;
     if (name !== "popups") {
+      clearInterestReelSchedule();
       deactivateAllTriggers();
     }
   }
 
-  function markInteraction(kind) {
+  function markInteraction(kind, eventData) {
     const now = Date.now();
     state.lastInteractionAt = now;
+    if (kind === "pointerdown") {
+      capturePointerPressure(eventData);
+    }
     if (kind === "click") {
       state.clickTimestamps.push(now);
       const cutoff = now - 1000;
       state.clickTimestamps = state.clickTimestamps.filter((ts) => ts >= cutoff);
+      if (state.clickTimestamps.length >= 7 && now - state.lastRapidTapEventAt > 9000) {
+        state.lastRapidTapEventAt = now;
+        requestTriggerFromAI("high_tap_intensity", {
+          click_frequency: state.clickTimestamps.length,
+        });
+      }
     }
     if (kind === "scroll" || kind === "click" || kind === "keydown") {
       clearIdleVisuals();
@@ -1100,6 +1373,8 @@ const StressTriggers = (() => {
     const force = Boolean(context?.force);
     if (disableStressMode) return { ok: false, reason: "disabled" };
     if (!force && state.stage !== "popups") return { ok: false, reason: "stage" };
+    if (!force && isInterruptionActive()) return { ok: false, reason: "interruption" };
+    if (!force && isInQuietBreak()) return { ok: false, reason: "quiet-break" };
     if (active.has(name)) return { ok: false, reason: "active" };
     if (!force && state.lastTriggerName === name) return { ok: false, reason: "repeat" };
     if (active.size >= 1) return { ok: false, reason: "max-active" };
@@ -1133,7 +1408,40 @@ const StressTriggers = (() => {
     cooldownUntil.set(name, Date.now() + cooldown);
   }
 
-  function registerTrigger(name, cleanupFn, durationMs) {
+  function estimateConfidence(userState) {
+    const changeCount = Number(userState?.answerChangeCount || 0);
+    const idleMs = Number(userState?.idleMs || 0);
+    const idlePenalty = Math.min(0.4, idleMs / 30000);
+    const changePenalty = Math.min(0.45, changeCount * 0.12);
+    const confidence = 0.85 - idlePenalty - changePenalty;
+    return Math.max(0, Math.min(1, confidence));
+  }
+
+  function snapshotFeedbackMetrics(userState) {
+    const curr = userState || currentUserState();
+    return {
+      time_spent: Math.max(0, Math.floor(Number(curr.timeOnQuestionMs || 0))),
+      confidence: estimateConfidence(curr),
+      accuracy: Boolean(state.lastAnswerWasCorrect),
+    };
+  }
+
+  function enqueueTriggerOutcome(outcome) {
+    if (!outcome || !outcome.trigger) return;
+    state.recentTriggerOutcomes.push(outcome);
+    if (state.recentTriggerOutcomes.length > 24) {
+      state.recentTriggerOutcomes = state.recentTriggerOutcomes.slice(-24);
+    }
+  }
+
+  function persistTriggerOutcome(outcome) {
+    if (!sessionId || !outcome || !outcome.trigger) return;
+    postJSON(`/session/${sessionId}/trigger-feedback`, outcome).catch((err) => {
+      debugLog("feedback_persist_error", err?.message || String(err));
+    });
+  }
+
+  function registerTrigger(name, cleanupFn, durationMs, context) {
     const timers = [];
     if (durationMs > 0) {
       timers.push(
@@ -1142,7 +1450,15 @@ const StressTriggers = (() => {
         }, durationMs)
       );
     }
-    active.set(name, { cleanupFn, timers, activatedAt: Date.now() });
+    active.set(name, {
+      cleanupFn,
+      timers,
+      activatedAt: Date.now(),
+      feedback: {
+        intensity: String(context?.intensity || "low").toLowerCase(),
+        pre_metrics: snapshotFeedbackMetrics(context?.userState),
+      },
+    });
     state.lastTriggerActivatedAt = Date.now();
     state.lastTriggerName = name;
     state.recentTriggerNames.push(name);
@@ -1151,7 +1467,27 @@ const StressTriggers = (() => {
     }
     setCooldown(name);
     activationCounts.set(name, (activationCounts.get(name) || 0) + 1);
+    const consumedBudget = consumeBudgetForIntensity(context?.intensity || "medium");
     refreshDevButtonState(name);
+    logPopupEvent({
+      event: "trigger_activated",
+      trigger: name,
+      at: new Date().toISOString(),
+      duration_ms: durationMs,
+      reason: String(context?.reason || ""),
+      intensity: String(context?.intensity || "low"),
+      budget_spent: consumedBudget,
+      budget_after: state.stressBudget,
+    });
+    log("trigger_activated", {
+      trigger: name,
+      at: new Date().toISOString(),
+      duration_ms: durationMs,
+      reason: String(context?.reason || ""),
+      intensity: String(context?.intensity || "low"),
+      budget_spent: consumedBudget,
+      budget_after: state.stressBudget,
+    });
     debugLog("activated", name);
   }
 
@@ -1166,6 +1502,30 @@ const StressTriggers = (() => {
     }
     active.delete(name);
     state.lastTriggerEndedAt = Date.now();
+    state.screenQuietUntil = Date.now() + SCREEN_QUIET_BREAK_MS;
+
+    const outcome = {
+      trigger: name,
+      intensity: entry?.feedback?.intensity || "low",
+      timestamp: Date.now(),
+      pre_metrics: entry?.feedback?.pre_metrics || snapshotFeedbackMetrics(),
+      post_metrics: snapshotFeedbackMetrics(),
+    };
+    enqueueTriggerOutcome(outcome);
+    persistTriggerOutcome(outcome);
+
+    logPopupEvent({
+      event: "trigger_deactivated",
+      trigger: name,
+      at: new Date().toISOString(),
+      outcome,
+    });
+    log("trigger_deactivated", {
+      trigger: name,
+      at: new Date().toISOString(),
+      outcome,
+    });
+
     refreshDevButtonState(name);
     debugLog("ended", name);
 
@@ -1176,6 +1536,7 @@ const StressTriggers = (() => {
         requestTriggerFromAI("queued_followup", {
           queued_event: queued.eventType,
           from_trigger: name,
+          ...(queued.extra || {}),
         });
       }, 180);
     }
@@ -2172,8 +2533,59 @@ const StressTriggers = (() => {
 
   function triggerBollywoodReelTrap() {
     const shell = getAppShell();
+    acquireInterruptionLock("news");
 
-    function inferTopicFromAnswers() {
+    function inferStudentSignals() {
+      const recent = state.followupAnswers.slice(-14);
+      const corpus = recent
+        .map((entry) => `${entry.answer || ""} ${entry.domain || ""} ${entry.slot || ""}`)
+        .join(" ")
+        .toLowerCase();
+
+      const buckets = [
+        { key: "sports", test: /cricket|football|sport|match|league|ipl|badminton/ },
+        { key: "music", test: /music|song|dance|playlist|guitar|rap|singer/ },
+        { key: "games", test: /game|gaming|esports|valorant|bgmi|pubg|minecraft|fifa/ },
+        { key: "technology", test: /tech|ai|coding|app|software|phone|device/ },
+        { key: "movies", test: /movie|film|series|actor|cinema|bollywood|reel/ },
+        { key: "health", test: /health|sleep|stress|focus|diet|gym|exercise/ },
+        { key: "science", test: /science|physics|chemistry|biology|space|research/ },
+      ];
+
+      const interests = buckets.filter((b) => b.test.test(corpus)).map((b) => b.key);
+      const emotion = /anxious|panic|worried|stress|overwhelm|scared/.test(corpus)
+        ? "stressed"
+        : /excited|motivated|confident|happy/.test(corpus)
+          ? "energized"
+          : "neutral";
+
+      return {
+        interests: interests.slice(0, 4),
+        emotion,
+        shortContext: recent
+          .slice(-4)
+          .map((item) => String(item.answer || "").trim())
+          .filter(Boolean)
+          .slice(0, 3),
+      };
+    }
+
+    function inferTopicFromAnswers(signals) {
+      const preferredTopic = mapFeedbackTopicToReelTopic(state.feedbackTopicPreference);
+      if (preferredTopic) {
+        const emojiMap = {
+          sports: "🏅",
+          music: "🎵",
+          games: "🎮",
+          technology: "🤖",
+          movies: "🎬",
+          health: "🩺",
+          science: "🔬",
+          world: "🌍",
+        };
+        return { topic: preferredTopic, emoji: emojiMap[preferredTopic] || "🌟" };
+      }
+
       const corpus = state.followupAnswers
         .slice(-12)
         .map((entry) => `${entry.answer || ""} ${entry.domain || ""} ${entry.slot || ""}`)
@@ -2181,33 +2593,34 @@ const StressTriggers = (() => {
         .toLowerCase();
       if (/cricket|football|sport|match|league/.test(corpus)) return { topic: "sports", emoji: "🏅" };
       if (/music|song|dance|playlist|guitar|rap/.test(corpus)) return { topic: "music", emoji: "🎵" };
+      if (/game|gaming|esports|valorant|bgmi|pubg|minecraft|fifa/.test(corpus)) return { topic: "games", emoji: "🎮" };
       if (/tech|ai|coding|app|software|phone|device/.test(corpus)) return { topic: "technology", emoji: "🤖" };
       if (/movie|film|series|actor|cinema/.test(corpus)) return { topic: "movies", emoji: "🎬" };
       if (/health|sleep|stress|focus|diet/.test(corpus)) return { topic: "health", emoji: "🩺" };
+      if (Array.isArray(signals?.interests) && signals.interests.length) {
+        const fromInterest = signals.interests[0];
+        const emojiMap = {
+          sports: "🏅",
+          music: "🎵",
+          games: "🎮",
+          technology: "🤖",
+          movies: "🎬",
+          health: "🩺",
+          science: "🔬",
+          world: "🌍",
+        };
+        return { topic: fromInterest, emoji: emojiMap[fromInterest] || "🌟" };
+      }
       const fallback = [
         { topic: "movies", emoji: "🎬" },
         { topic: "movies", emoji: "🎬" },
         { topic: "movies", emoji: "🎬" },
         { topic: "technology", emoji: "🤖" },
+        { topic: "games", emoji: "🎮" },
         { topic: "science", emoji: "🔬" },
         { topic: "world", emoji: "🌍" },
       ];
       return fallback[Math.floor(Math.random() * fallback.length)];
-    }
-
-    function pickBestHeadline(headlines) {
-      if (!Array.isArray(headlines) || !headlines.length) return null;
-      const scored = headlines
-        .filter((item) => item && item.title)
-        .map((item) => {
-          const title = String(item.title || "");
-          let score = Math.min(40, title.length);
-          if (/breaking|latest|new|first|watch|major|report/i.test(title)) score += 12;
-          if (/:/.test(title)) score += 8;
-          return { item, score };
-        })
-        .sort((a, b) => b.score - a.score);
-      return scored[0]?.item || null;
     }
 
     const factBank = {
@@ -2265,6 +2678,15 @@ const StressTriggers = (() => {
           source: "Audio Trends",
         },
       ],
+      games: [
+        {
+          title: "Competitive game training methods are entering student focus routines",
+          summary: "Short strategy cycles from gaming are now being reused by students for timed problem-solving practice.",
+          detail: "Learning coaches report that game-style round planning helps improve pacing and fast decision confidence in tests.",
+          joke: "Student said one last match; timer said final boss is your exam.",
+          source: "Game Insight Desk",
+        },
+      ],
       health: [
         {
           title: "Hydration and cognitive stamina are more linked than students assume",
@@ -2276,42 +2698,104 @@ const StressTriggers = (() => {
       ],
     };
 
-    const topicCtx = inferTopicFromAnswers();
-    const panel = document.createElement("div");
-    panel.className = "stress-news-quiz is-fact-edition";
-    panel.setAttribute("role", "dialog");
-    panel.setAttribute("aria-modal", "true");
-    panel.innerHTML = `
-      <div class="news-quiz-card fact-edition app-popup-fact">
-        <div class="fact-popup-topbar">
-          <div class="fact-app-dot" aria-hidden="true"></div>
-          <div class="fact-app-title">News Flash</div>
-          <div class="fact-app-time">now</div>
-        </div>
-        <div class="fact-popup-body">
-          <div class="fact-topic">${topicCtx.emoji} ${escapeHTML(topicCtx.topic)} update</div>
-          <div class="news-list" data-role="story"></div>
-        </div>
-      </div>
-    `;
+    const studentSignals = inferStudentSignals();
+    const recentTopics = (state.newsReelHistory || []).slice(-3).map((item) => item.topic);
+    let topicCtx = inferTopicFromAnswers(studentSignals);
+    if (recentTopics.filter((t) => t === topicCtx.topic).length >= 2) {
+      const rotateOrder = ["movies", "technology", "games", "music", "sports", "health", "science", "world"];
+      const nextTopic = rotateOrder.find((item) => !recentTopics.includes(item)) || rotateOrder[(Date.now() / 1000) % rotateOrder.length | 0];
+      const emojiMap = { movies: "🎬", technology: "🤖", games: "🎮", music: "🎵", sports: "🏅", health: "🩺", science: "🔬", world: "🌍" };
+      topicCtx = { topic: nextTopic, emoji: emojiMap[nextTopic] || "🌟" };
+    }
 
-    document.body.appendChild(panel);
-    shell?.classList.add("stress-news-diversion-open");
+    const topicVisuals = {
+      movies: [
+        "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1517604931442-7e0c8ed2963c?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1595769816263-9b910be24d5f?auto=format&fit=crop&w=900&q=70",
+      ],
+      music: [
+        "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1511379938547-c1f69419868d?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1507838153414-b4b713384a76?auto=format&fit=crop&w=900&q=70",
+      ],
+      sports: [
+        "https://images.unsplash.com/photo-1461896836934-ffe607ba8211?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1471295253337-3ceaaedca402?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1517649763962-0c623066013b?auto=format&fit=crop&w=900&q=70",
+      ],
+      technology: [
+        "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1519389950473-47ba0277781c?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1517430816045-df4b7de11d1d?auto=format&fit=crop&w=900&q=70",
+      ],
+      games: [
+        "https://images.unsplash.com/photo-1511512578047-dfb367046420?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1493711662062-fa541adb3fc8?auto=format&fit=crop&w=900&q=70",
+      ],
+      health: [
+        "https://images.unsplash.com/photo-1498837167922-ddd27525d352?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1506126613408-eca07ce68773?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1526256262350-7da7584cf5eb?auto=format&fit=crop&w=900&q=70",
+      ],
+      science: [
+        "https://images.unsplash.com/photo-1532187863486-abf9dbad1b69?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1507413245164-6160d8298b31?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1581093458791-9f3c3900df4b?auto=format&fit=crop&w=900&q=70",
+      ],
+      world: [
+        "https://images.unsplash.com/photo-1521295121783-8a321d551ad2?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1480714378408-67cf0d13bc1f?auto=format&fit=crop&w=900&q=70",
+        "https://images.unsplash.com/photo-1467269204594-9661b134dd2b?auto=format&fit=crop&w=900&q=70",
+      ],
+    };
 
-    const storyEl = panel.querySelector('[data-role="story"]');
-    async function renderFact() {
+    function chooseVisual(topic, directUrl) {
+      if (directUrl) return String(directUrl);
+      const pool = topicVisuals[topic] || topicVisuals.movies;
+      const recentImages = (state.newsReelHistory || []).slice(-2).map((item) => item.image);
+      const candidates = pool.filter((url) => !recentImages.includes(url));
+      const source = candidates.length ? candidates : pool;
+      const idx = stableHash(`${sessionId || "anon"}|${topic}|${Date.now()}|${state.newsReelHistory.length}`) % source.length;
+      return source[idx];
+    }
+
+    let panel = null;
+    let disposed = false;
+    let autoCloseTimer = null;
+    const displayMs = stableRange("bollywoodReelTrap_duration", 5000, 7000);
+    const safetyTimer = setTimeout(() => {
+      deactivateTrigger("bollywoodReelTrap");
+    }, 15000);
+
+    (async () => {
       let best = null;
       try {
         const data = await postJSON("/api/bollywood/reel-fact", {
           topic_hint: topicCtx.topic,
+          force_topic: Boolean(mapFeedbackTopicToReelTopic(state.feedbackTopicPreference)),
           followup_answers: state.followupAnswers.slice(-12),
+          student_profile: {
+            name: String(userNameInput?.value || "").trim(),
+            interests: [
+              ...new Set([
+                mapFeedbackTopicToReelTopic(state.feedbackTopicPreference),
+                ...(studentSignals.interests || []),
+              ].filter(Boolean)),
+            ],
+            emotion: studentSignals.emotion,
+            recent_context: studentSignals.shortContext,
+          },
+          avoid_titles: (state.newsReelHistory || []).slice(-6).map((item) => item.title),
+          variation_seed: Date.now(),
         });
         best = {
           title: data?.title,
           summary: data?.summary,
-          detail: data?.detail,
-          joke: data?.joke,
           source: data?.source,
+          topic: data?.topic,
+          image_url: data?.image_url || data?.image || data?.thumbnail_url,
         };
       } catch (e) {
         best = null;
@@ -2319,38 +2803,221 @@ const StressTriggers = (() => {
 
       if (!best || !best.title || !best.summary) {
         const topicFacts = factBank[topicCtx.topic] || factBank.movies || factBank.technology;
-        best = topicFacts[Math.floor(Math.random() * topicFacts.length)] || topicFacts[0];
+        const fallbackFact = topicFacts[Math.floor(Math.random() * topicFacts.length)] || topicFacts[0];
+        best = {
+          title: fallbackFact?.title,
+          summary: fallbackFact?.summary,
+          source: fallbackFact?.source,
+          topic: topicCtx.topic,
+          image_url: "",
+        };
       }
 
-      const title = escapeHTML(best?.title || "Latest update");
+      if (disposed) return;
+
+      const lockedTopic = mapFeedbackTopicToReelTopic(state.feedbackTopicPreference);
+      const chosenTopic = String(lockedTopic || best?.topic || topicCtx.topic || "movies").toLowerCase();
+      const imageUrl = chooseVisual(chosenTopic, best?.image_url);
+      let rawTitle = String(best?.title || "Latest update").trim();
+      const recentTitles = (state.newsReelHistory || []).slice(-4).map((item) => String(item.title || "").toLowerCase());
+      if (rawTitle && recentTitles.includes(rawTitle.toLowerCase())) {
+        const stamp = ["Campus pulse", "Now trending", "Fresh reel"][stableHash(`${rawTitle}|${Date.now()}`) % 3];
+        rawTitle = `${stamp}: ${rawTitle}`;
+      }
+      const title = escapeHTML(rawTitle);
       const source = escapeHTML(best?.source || "News");
-      const summary = escapeHTML(String(best?.summary || "Read this quick fact and return to test focus.").slice(0, 280));
-      const detail = escapeHTML(String(best?.detail || "Recent trend checks suggest this update is likely to stay relevant for student discussions this week.").slice(0, 280));
-      const joke = escapeHTML(String(best?.joke || "Even the syllabus needs an intermission.").slice(0, 160));
+      const preferredInterest = lockedTopic || studentSignals.interests[0] || "";
+      const interestHook = preferredInterest
+        ? `Based on your interest in ${preferredInterest}.`
+        : "Picked from your recent answers.";
+      const baseSummary = String(best?.summary || "Quick update, now back to your test.").slice(0, 95).trim();
+      const summary = escapeHTML(`${baseSummary} ${interestHook}`.slice(0, 130));
+      const topicLabel = `${topicCtx.emoji} ${escapeHTML(chosenTopic)} reel`;
 
-      if (storyEl) {
-        storyEl.innerHTML = `
-          <article class="news-item fact-story-block auto-pop expanded">
-            <h4><span>${title}</span></h4>
-            <p class="news-story">${summary}</p>
-            <p class="news-story extra">${detail}</p>
-            <p class="fact-joke">${joke}</p>
-            <p class="fact-meta">${source} • just now</p>
+      panel = document.createElement("div");
+      panel.className = "stress-news-quiz is-fact-edition";
+      panel.setAttribute("role", "dialog");
+      panel.setAttribute("aria-modal", "true");
+      panel.innerHTML = `
+        <div class="news-quiz-card fact-edition app-popup-fact insta-mini-banner">
+          <div class="fact-popup-topbar">
+            <div class="fact-app-live">
+              <span class="fact-app-dot" aria-hidden="true"></span>
+              <span class="fact-live-label">LIVE</span>
+            </div>
+            <div class="fact-app-title">For You</div>
+            <div class="fact-app-time">now</div>
+          </div>
+          <article class="insta-banner-body">
+            <img class="insta-banner-media" src="${escapeHTML(imageUrl)}" alt="${escapeHTML(chosenTopic)} update" loading="eager" decoding="async" referrerpolicy="no-referrer" />
+            <div class="insta-banner-copy">
+              <p class="fact-topic">${topicLabel}</p>
+              <h4 class="insta-banner-title">${title}</h4>
+              <p class="insta-banner-caption">${summary}</p>
+              <p class="insta-banner-meta">${source} • just now</p>
+            </div>
           </article>
-        `;
+        </div>
+      `;
+
+      document.body.appendChild(panel);
+      shell?.classList.add("stress-news-diversion-open");
+
+      state.lastNewsTopic = chosenTopic;
+      state.lastNewsImage = imageUrl;
+      state.newsReelHistory.push({
+        topic: chosenTopic,
+        image: imageUrl,
+        title: rawTitle,
+        at: Date.now(),
+      });
+      if (state.newsReelHistory.length > 20) {
+        state.newsReelHistory = state.newsReelHistory.slice(-20);
       }
 
-    }
-
-    renderFact();
+      autoCloseTimer = setTimeout(() => {
+        deactivateTrigger("bollywoodReelTrap");
+      }, displayMs);
+    })().catch(() => {
+      deactivateTrigger("bollywoodReelTrap");
+    });
 
     return {
-      durationMs: stableRange("bollywoodReelTrap_duration", 5000, 7000),
+      durationMs: 0,
       cleanup: () => {
+        disposed = true;
+        clearTimeout(autoCloseTimer);
+        clearTimeout(safetyTimer);
         shell?.classList.remove("stress-news-diversion-open");
-        panel.remove();
+        panel?.remove();
+        releaseInterruptionLock("news");
       },
     };
+  }
+
+  function inferFeedbackMood(userState) {
+    const accuracy = getRecentAccuracy();
+    const idleMs = Number(userState?.idleMs || 0);
+    const changes = Number(userState?.answerChangeCount || 0);
+    const streak = Number(state.correctStreak || 0);
+    const wrong = Number(state.wrongAnswersCount || 0);
+
+    if (accuracy < 0.45 || wrong >= 3) return "stressed";
+    if (idleMs > 9000 || changes >= 3) return "anxious";
+    if (accuracy >= 0.75 && streak >= 2) return "confident";
+    return "focused";
+  }
+
+  function selectFeedbackPrompt(mood) {
+    const bucket = FEEDBACK_PROMPT_LIBRARY[mood] || FEEDBACK_PROMPT_LIBRARY.focused;
+    const offset = state.feedbackResponseHistory.length % bucket.length;
+    return bucket[offset];
+  }
+
+  function showFeedbackPulse(reason, promptOverride) {
+    if (state.stage !== "popups") return;
+    if (state.feedbackPromptOpen) return;
+    if (isInterruptionActive()) return;
+
+    const now = Date.now();
+    if (now - Number(state.feedbackLastShownAt || 0) < FEEDBACK_MIN_INTERVAL_MS) return;
+
+    const userState = currentUserState();
+    const mood = inferFeedbackMood(userState);
+    const survey = buildFeedbackSurvey(mood, reason, promptOverride);
+    const prompt = survey.prompt;
+    const options = survey.options;
+
+    state.feedbackPromptOpen = true;
+    state.feedbackLastShownAt = now;
+    state.lastFeedbackQuestionType = survey.kind;
+    acquireInterruptionLock("feedback");
+
+    const card = document.createElement("div");
+    card.className = "stress-feedback-pulse";
+    card.setAttribute("role", "dialog");
+    card.setAttribute("aria-live", "polite");
+    card.innerHTML = `
+      <div class="feedback-pulse-card">
+        <div class="feedback-pulse-eyebrow">${escapeHTML(survey.eyebrow)}</div>
+        <div class="feedback-pulse-question">${escapeHTML(prompt)}</div>
+        <div class="feedback-chip-wrap"></div>
+        <div class="feedback-pulse-actions">
+          <button type="button" data-role="skip" class="feedback-pulse-skip">Not now</button>
+        </div>
+      </div>
+    `;
+
+    const chipWrap = card.querySelector(".feedback-chip-wrap");
+    options.forEach((opt) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "feedback-chip";
+      btn.textContent = opt;
+      btn.addEventListener("click", () => finalizeFeedback(opt));
+      chipWrap?.appendChild(btn);
+    });
+
+    const skipBtn = card.querySelector('[data-role="skip"]');
+    skipBtn?.addEventListener("click", () => finalizeFeedback("Skipped"));
+    document.body.appendChild(card);
+
+    const closeTimer = setTimeout(() => finalizeFeedback("No response"), FEEDBACK_PROMPT_MAX_OPEN_MS);
+
+    function finalizeFeedback(choice) {
+      clearTimeout(closeTimer);
+      if (!card.isConnected) return;
+      card.remove();
+
+      const payload = {
+        at: Date.now(),
+        reason: String(reason || "pulse"),
+        kind: survey.kind,
+        mood,
+        answer: String(choice || ""),
+        question: prompt,
+      };
+      state.feedbackResponseHistory.push(payload);
+      if (state.feedbackResponseHistory.length > 30) {
+        state.feedbackResponseHistory = state.feedbackResponseHistory.slice(-30);
+      }
+
+      let intensity = mood === "stressed" || mood === "anxious" ? "medium" : "low";
+
+      if (survey.kind === "difficulty") {
+        const selected = String(choice || "").toLowerCase();
+        if (selected.includes("hard")) state.feedbackDifficultyPreference = "hard";
+        else if (selected.includes("easy")) state.feedbackDifficultyPreference = "easy";
+        else state.feedbackDifficultyPreference = "medium";
+      }
+
+      if (survey.kind === "topic") {
+        scheduleInterestReelTrigger(choice);
+      }
+
+      if (survey.kind === "mood") {
+        const lower = String(choice || "").toLowerCase();
+        if (/need challenge|confident|excited/.test(lower)) state.feedbackDifficultyPreference = "hard";
+        if (/overwhelmed|stressed|need a short pause|anxious/.test(lower)) state.feedbackDifficultyPreference = "easy";
+      }
+
+      intensity = applyFeedbackIntensityBias(intensity);
+
+      if (sessionId) {
+        const snapshot = snapshotFeedbackMetrics(userState);
+        postJSON(`/session/${sessionId}/trigger-feedback`, {
+          trigger: `student_feedback_pulse:${mood}`,
+          intensity,
+          pre_metrics: snapshot,
+          post_metrics: snapshot,
+          recovery_metrics: snapshot,
+          note: `[${survey.kind}] ${prompt} -> ${choice}`,
+        }).catch((err) => debugLog("feedback_persist_error", err?.message || String(err)));
+      }
+
+      state.feedbackPromptOpen = false;
+      releaseInterruptionLock("feedback");
+    }
   }
 
   const triggerHandlers = {
@@ -2400,154 +3067,127 @@ const StressTriggers = (() => {
     if (durationMs > 0) {
       durationMs = Math.max(2000, Math.min(12000, durationMs));
     }
-    registerTrigger(name, out.cleanup, durationMs);
+    registerTrigger(name, out.cleanup, durationMs, context);
     return true;
   }
 
-  function chooseFallbackTrigger(eventType, userState, available) {
-    const map = {
-      enter_popups: ["fakeMentorCount", "phantomCompetitor", "stressTimer"],
-      wrong_answer: ["confidenceBreaker", "stressTimer", "phantomCompetitor"],
-      answer_changed: ["optionShuffle", "hesitationHeatmap", "mirageHighlight"],
-      hover_hesitation: ["mirageHighlight", "hesitationHeatmap"],
-      long_hesitation: ["phantomCompetitor", "stressTimer", "spatialTicking"],
-      idle_resumed: ["blurAttack", "chaosBackground", "bollywoodReelTrap"],
-      time_pressure: ["heartbeatVibration", "stressTimer", "fakeLowBattery"],
-      question_loaded: ["fakeMentorCount", "phantomCompetitor"],
-      submit_attempt: ["spatialTicking", "stressTimer"],
-      post_answer_random: ["confidenceBreaker", "spatialTicking", "stressTimer"],
+  function queueTriggerRequest(eventType, extra, delayMs) {
+    if (isInterruptionActive()) return;
+    state.queuedTriggerRequest = {
+      eventType,
+      extra: extra || {},
+      at: Date.now(),
     };
-    const candidates = map[eventType] || [];
-    for (const name of candidates) {
-      if (available.includes(name)) return name;
-    }
-    if (userState.answerChangeCount >= 3 && available.includes("optionShuffle")) return "optionShuffle";
-    if (userState.timeOnQuestionMs > 12000 && available.includes("phantomCompetitor")) return "phantomCompetitor";
-    return null;
-  }
-
-  function chooseSerialTrigger(available) {
-    if (!available.length) return null;
-    for (let i = 0; i < serialTriggerOrder.length; i += 1) {
-      const idx = (state.serialTriggerCursor + i) % serialTriggerOrder.length;
-      const name = serialTriggerOrder[idx];
-      if (available.includes(name)) {
-        state.serialTriggerCursor = (idx + 1) % serialTriggerOrder.length;
-        return name;
+    if (state.aiDebounceTimer) return;
+    const waitMs = Math.max(AI_DECISION_DEBOUNCE_MS, Math.floor(Number(delayMs || 0)));
+    state.aiDebounceTimer = setTimeout(() => {
+      state.aiDebounceTimer = null;
+      if (!state.queuedTriggerRequest) return;
+      if (state.stage !== "popups") {
+        state.queuedTriggerRequest = null;
+        return;
       }
+      if (active.size >= 1) return;
+      const queued = state.queuedTriggerRequest;
+      state.queuedTriggerRequest = null;
+      requestTriggerFromAI(queued.eventType, queued.extra);
+    }, waitMs);
+  }
+
+  function pickLocalFallbackTrigger(eventType, userState, available, decision) {
+    if (!Array.isArray(available) || !available.length) return "";
+    const recent = new Set((state.recentTriggerNames || []).slice(-4));
+    const scored = evaluateUserState(userState).map((item) => item.name);
+    const suggested = String(decision?.suggested_trigger || "").trim();
+
+    const ordered = [];
+    const seen = new Set();
+    const pushName = (name) => {
+      if (!name || seen.has(name)) return;
+      seen.add(name);
+      ordered.push(name);
+    };
+
+    if (suggested && available.includes(suggested)) pushName(suggested);
+    scored.forEach((name) => {
+      if (available.includes(name)) pushName(name);
+    });
+    available.forEach(pushName);
+
+    for (const name of ordered) {
+      if (recent.has(name)) continue;
+      if (canActivateTrigger(name, { userState }).ok) return name;
     }
-    return null;
-  }
-
-  function chooseRandomTrigger(available) {
-    if (!available.length) return null;
-    const filtered = available.filter((name) => name !== state.lastTriggerName);
-    const pool = filtered.length ? filtered : available;
-    const idx = Math.floor(Math.random() * pool.length);
-    return pool[idx] || null;
-  }
-
-  function emergencyForceTrigger(reason) {
-    if (state.stage !== "popups") return false;
-    if (active.size >= 1) return false;
-    const userState = currentUserState();
-    const guaranteed = [
-      "fakeMentorCount",
-      "phantomCompetitor",
-      "stressTimer",
-      "spatialTicking",
-      "confidenceBreaker",
-    ];
-    const candidates = shuffleList(guaranteed.filter((name) => triggerHandlers[name]));
-    const ok = tryActivateFromCandidates(candidates, userState, `emergency:${reason}`, 4200, true);
-    return ok;
-  }
-
-  function shuffleList(items) {
-    const arr = [...items];
-    for (let i = arr.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
+    for (const name of ordered) {
+      if (canActivateTrigger(name, { userState }).ok) return name;
     }
-    return arr;
-  }
-
-  function tryActivateFromCandidates(candidates, userState, reasonBase, timeoutMs, force = false) {
-    for (const name of candidates) {
-      const ok = activateTrigger(name, {
-        userState,
-        timeoutMs,
-        force,
-        reason: `${reasonBase}:${name}`,
-      });
-      if (ok) return true;
-    }
-    return false;
+    return "";
   }
 
   async function requestTriggerFromAI(eventType, extra) {
     if (disableStressMode) return false;
     if (state.stage !== "popups") return false;
+    if (isInterruptionActive()) return false;
+    if (isInQuietBreak()) return false;
     if (!testQuestions.length) return false;
     if (active.size >= 1) {
-      state.queuedTriggerRequest = { eventType, at: Date.now() };
+      queueTriggerRequest(eventType, extra, AI_DECISION_DEBOUNCE_MS);
       return false;
     }
 
     const now = Date.now();
-    if (state.aiDecisionInFlight) return false;
-    if (now - state.lastAIDecisionAt < AI_DECISION_MIN_GAP_MS) return false;
+    if (state.aiDecisionInFlight) {
+      queueTriggerRequest(eventType, extra, AI_DECISION_DEBOUNCE_MS);
+      return false;
+    }
+    if (now < Number(state.aiBackoffUntil || 0)) {
+      queueTriggerRequest(eventType, extra, Number(state.aiBackoffUntil || 0) - now + AI_DECISION_DEBOUNCE_MS);
+      return false;
+    }
+    if (now - state.lastAIDecisionAt < AI_DECISION_MIN_GAP_MS) {
+      queueTriggerRequest(eventType, extra, AI_DECISION_MIN_GAP_MS - (now - state.lastAIDecisionAt));
+      return false;
+    }
 
     const userState = currentUserState();
     const available = getTriggerNames().filter((name) => canActivateTrigger(name, { userState }).ok);
 
-    // Keepalive path: do not wait on AI when no trigger is active.
-    // This guarantees continuous trigger presence; AI remains primary for all other events.
-    if (eventType === "ensure_active" && available.length) {
-      const randomCandidates = shuffleList(available);
-      const randomActivated = tryActivateFromCandidates(
-        randomCandidates,
-        userState,
-        "keepalive-random:ensure_active",
-        0,
-        false
-      );
-      if (randomActivated) return true;
-
-      const serialFallback = chooseSerialTrigger(available);
-      if (serialFallback) {
-        const serialActivated = tryActivateFromCandidates(
-          [serialFallback, ...available.filter((name) => name !== serialFallback)],
-          userState,
-          "keepalive-serial:ensure_active",
-          0,
-          false
-        );
-        if (serialActivated) return true;
-      }
-    }
-
-    if (!available.length) {
-      // Ensure the test never goes silent for too long: force one random trigger when all are cooling down.
-      if (eventType === "ensure_active") {
-        const all = getTriggerNames().filter((name) => !active.has(name));
-        const forcedCandidates = shuffleList(all);
-        return tryActivateFromCandidates(
-          forcedCandidates,
-          userState,
-          "force-random:ensure_active",
-          4200,
-          true
-        );
-      }
-      return false;
-    }
+    if (!available.length) return false;
 
     state.aiDecisionInFlight = true;
     state.lastAIDecisionAt = now;
     try {
+      const elapsedSeconds = getElapsedSeconds();
+      const remainingMs = timeRemainingMs();
+      const testPhase = getTestPhase();
+      const recentAccuracy = getRecentAccuracy();
+      const interactionHesitationMs = Math.max(
+        Number(state.interactionHesitationMs || 0),
+        Number(userState.timeOnQuestionMs || 0) > 8000 ? Number(userState.timeOnQuestionMs || 0) : 0
+      );
+
       const payload = {
+        event_name: eventType,
         event_type: eventType,
+        context: {
+          platform: getPlatform(),
+          elapsed_seconds: elapsedSeconds,
+          time_remaining_seconds: Math.max(0, Math.floor(remainingMs / 1000)),
+          test_phase: testPhase,
+          current_stress_budget: state.stressBudget,
+        },
+        telemetry: {
+          response_time_ms: Number.isFinite(userState.answerLatencyMs)
+            ? Math.max(0, Math.floor(userState.answerLatencyMs))
+            : 0,
+          interaction_hesitation_ms: Math.max(0, Math.floor(interactionHesitationMs)),
+          recent_accuracy: recentAccuracy,
+          avg_touch_pressure: getAvgTouchPressure(),
+          tap_velocity: Math.max(0, Math.min(1, userState.clickFrequency / 10)),
+          device_movement_index: Math.max(0, Math.min(10, Number(state.deviceMovementIndex || 0))),
+          app_focus_loss_count: state.lastContextSwitchAt ? 1 : 0,
+          current_stress_budget: state.stressBudget,
+        },
         user_state: {
           time_on_question_ms: Math.floor(userState.timeOnQuestionMs || 0),
           idle_ms: Math.floor(userState.idleMs || 0),
@@ -2557,75 +3197,100 @@ const StressTriggers = (() => {
           hover_intent_on_option: Boolean(userState.hoverIntentOnOption),
           is_submitting_answer: Boolean(userState.isSubmittingAnswer),
           question_difficulty: String(userState.questionDifficulty || ""),
+          feedback_difficulty_preference: String(state.feedbackDifficultyPreference || "medium"),
+          feedback_topic_preference: String(state.feedbackTopicPreference || ""),
         },
         metrics: {
           wrong_answers_count: state.wrongAnswersCount,
           total_submissions: state.totalSubmissions,
           correct_streak: state.correctStreak,
+          recent_accuracy: recentAccuracy,
         },
         available_triggers: available,
-        recent_triggers: state.recentTriggerNames.slice(-8),
+        recent_triggers: state.recentTriggerOutcomes.slice(-8),
         followup_answers: state.followupAnswers.slice(-8),
-        extra: extra || {},
+        student_preferences: {
+          preferred_interest_topic: String(state.feedbackTopicPreference || ""),
+          preferred_trigger_difficulty: String(state.feedbackDifficultyPreference || "medium"),
+          feedback_last_question_type: String(state.lastFeedbackQuestionType || ""),
+          feedback_recent: state.feedbackResponseHistory.slice(-6),
+        },
+        extra: {
+          ...(extra || {}),
+          session_id: sessionId || null,
+        },
       };
 
       const timeoutMsForDecision = eventType === "enter_popups" ? AI_DECISION_TIMEOUT_FAST_MS : AI_DECISION_TIMEOUT_MS;
       const decision = await postJSON(AI_TRIGGER_ENDPOINT, payload, { timeoutMs: timeoutMsForDecision });
+      const forceTrigger = String(extra?.force_trigger || "").trim();
       const triggerName = String(decision?.trigger_name || "").trim();
       const timeoutMs = Number(decision?.timeout_ms || 0);
+      const aiIntensity = String(decision?.intensity || "low").toLowerCase();
+      const tunedAIIntensity = applyFeedbackIntensityBias(aiIntensity);
+      if (Number.isFinite(Number(decision?.budget_after))) {
+        state.stressBudget = clampBudget(Number(decision?.budget_after));
+      }
 
-      if (triggerName && available.includes(triggerName)) {
-        const aiFirst = [triggerName, ...available.filter((name) => name !== triggerName)];
-        const aiActivated = tryActivateFromCandidates(
-          aiFirst,
+      let activated = false;
+      if (forceTrigger && available.includes(forceTrigger)) {
+        activated = activateTrigger(forceTrigger, {
           userState,
-          `ai:${eventType}`,
           timeoutMs,
-          false
-        );
-        if (aiActivated) return true;
+          force: false,
+          reason: `forced_by_feedback:${eventType}:${forceTrigger}`,
+          intensity: tunedAIIntensity,
+        });
+      }
+
+      if (!activated && triggerName && available.includes(triggerName)) {
+        activated = activateTrigger(triggerName, {
+          userState,
+          timeoutMs,
+          force: false,
+          reason: `ai:${eventType}:${triggerName}`,
+          intensity: tunedAIIntensity,
+        });
+      }
+
+      if (!activated) {
+        const fallbackName = pickLocalFallbackTrigger(eventType, userState, available, decision);
+        if (fallbackName) {
+          activated = activateTrigger(fallbackName, {
+            userState,
+            force: false,
+            reason: `local_fallback:${eventType}:${fallbackName}`,
+            intensity: applyFeedbackIntensityBias("medium"),
+          });
+        }
+      }
+
+      if (!activated) {
+        state.noActionStreak = Number(state.noActionStreak || 0) + 1;
+        if (state.noActionStreak >= 2) {
+          const forced = available.find((name) => canActivateTrigger(name, { userState }).ok);
+          if (forced) {
+            activated = activateTrigger(forced, {
+              userState,
+              force: false,
+              reason: `forced_recovery:${eventType}:${forced}`,
+              intensity: applyFeedbackIntensityBias("low"),
+            });
+          }
+        }
+      }
+
+      if (activated) {
+        state.noActionStreak = 0;
+        return true;
       }
     } catch (err) {
+      state.aiBackoffUntil = Date.now() + AI_DECISION_ERROR_BACKOFF_MS;
       debugLog("ai_trigger_error", err?.message || String(err));
     } finally {
       state.aiDecisionInFlight = false;
     }
 
-    // Priority after AI: random trigger -> event fallback -> serial fallback.
-    const randomCandidates = shuffleList(available);
-    const randomActivated = tryActivateFromCandidates(
-      randomCandidates,
-      userState,
-      `random:${eventType}`,
-      0,
-      false
-    );
-    if (randomActivated) {
-      return true;
-    }
-
-    const fallback = chooseFallbackTrigger(eventType, userState, available);
-    if (fallback) {
-      const fallbackActivated = tryActivateFromCandidates(
-        [fallback, ...available.filter((name) => name !== fallback)],
-        userState,
-        `fallback:${eventType}`,
-        0,
-        false
-      );
-      if (fallbackActivated) return true;
-    }
-
-    const serialFallback = chooseSerialTrigger(available);
-    if (serialFallback) {
-      return tryActivateFromCandidates(
-        [serialFallback, ...available.filter((name) => name !== serialFallback)],
-        userState,
-        `serial:${eventType}`,
-        0,
-        false
-      );
-    }
     return false;
   }
 
@@ -2689,10 +3354,15 @@ const StressTriggers = (() => {
     state.lastAnswerLatencyMs = null;
     state.hoverIntentOnOption = false;
     state.hoverOptionEl = null;
+    state.interactionHesitationMs = 0;
+    state.interactionHesitationStartedAt = 0;
     requestTriggerFromAI("question_loaded", {
       question_id: state.currentQuestionId,
       difficulty: state.questionDifficulty,
     });
+    setTimeout(() => {
+      showFeedbackPulse("question_rendered");
+    }, 1200);
   }
 
   function onOptionChange(questionId, prevValue, nextValue) {
@@ -2714,24 +3384,45 @@ const StressTriggers = (() => {
   function onOptionHover(optionEl) {
     state.hoverIntentOnOption = true;
     state.hoverOptionEl = optionEl || null;
+    state.interactionHesitationStartedAt = state.interactionHesitationStartedAt || Date.now();
     markInteraction("pointer");
     if (state.questionStartedAt && Date.now() - state.questionStartedAt > 7000) {
-      requestTriggerFromAI("hover_hesitation", {
+      state.interactionHesitationMs = Date.now() - state.questionStartedAt;
+      requestTriggerFromAI("interaction_hesitation", {
         question_id: state.currentQuestionId,
+        interaction_hesitation_ms: state.interactionHesitationMs,
       });
     }
+  }
+
+  function onOptionPointerDown(optionEl, evt) {
+    state.hoverOptionEl = optionEl || null;
+    state.interactionHesitationStartedAt = Date.now();
+    markInteraction("pointerdown", evt);
+  }
+
+  function onOptionPointerUp() {
+    if (!state.interactionHesitationStartedAt) return;
+    const hesitationMs = Date.now() - state.interactionHesitationStartedAt;
+    state.interactionHesitationStartedAt = 0;
+    if (hesitationMs < 650) return;
+    state.interactionHesitationMs = hesitationMs;
+    requestTriggerFromAI("interaction_hesitation", {
+      question_id: state.currentQuestionId,
+      interaction_hesitation_ms: hesitationMs,
+    });
   }
 
   function beginExamTimer() {
     if (!state.examStartedAt) {
       state.examStartedAt = Date.now();
+      state.stressBudget = STRESS_BUDGET_MAX;
     }
   }
 
   function onPopupsEntered() {
     // Reset gate timers so the very first trigger is attempted immediately.
     state.lastAIDecisionAt = 0;
-    state.lastEnsureActiveAt = 0;
     if (!testQuestions.length) return;
 
     requestTriggerFromAI("enter_popups", {
@@ -2739,13 +3430,6 @@ const StressTriggers = (() => {
       difficulty: state.questionDifficulty,
       immediate: true,
     });
-
-    // Hard safety net: if nothing appears quickly, force one visible trigger.
-    setTimeout(() => {
-      if (state.stage !== "popups") return;
-      if (active.size >= 1) return;
-      emergencyForceTrigger("enter_popups");
-    }, 1100);
   }
 
   function getFollowupAnswers() {
@@ -2769,24 +3453,27 @@ const StressTriggers = (() => {
 
   function noteAnswerOutcome(correct, hasAnswerKey) {
     state.totalSubmissions += 1;
-    if (Math.random() < POST_ANSWER_RANDOM_TRIGGER_PROB) {
-      requestTriggerFromAI("post_answer_random", {
-        correct,
-        has_answer_key: hasAnswerKey,
-        question_id: state.currentQuestionId,
-      });
+    if (hasAnswerKey) {
+      state.lastAnswerWasCorrect = Boolean(correct);
     }
     if (!hasAnswerKey) return;
     if (correct) {
       state.correctStreak += 1;
+      addBudget(3);
+      setTimeout(() => showFeedbackPulse("post_correct_answer"), 900);
       return;
     }
     state.correctStreak = 0;
     state.wrongAnswersCount += 1;
+    const confidenceNow = estimateConfidence(currentUserState());
+    if (confidenceNow < 0.4) {
+      addBudget(-5);
+    }
     requestTriggerFromAI("wrong_answer", {
       wrong_answers_count: state.wrongAnswersCount,
       question_id: state.currentQuestionId,
     });
+    setTimeout(() => showFeedbackPulse("post_wrong_answer"), 900);
   }
 
   function onReset() {
@@ -2800,13 +3487,38 @@ const StressTriggers = (() => {
     state.correctStreak = 0;
     state.aiDecisionInFlight = false;
     state.lastAIDecisionAt = 0;
+    state.aiBackoffUntil = 0;
     state.recentTriggerNames = [];
-    state.serialTriggerCursor = 0;
+    state.recentTriggerOutcomes = [];
     state.queuedTriggerRequest = null;
-    state.lastLongHesitationTriggerAt = 0;
-    state.lastEnsureActiveAt = 0;
+    if (state.aiDebounceTimer) {
+      clearTimeout(state.aiDebounceTimer);
+      state.aiDebounceTimer = null;
+    }
+    state.noActionStreak = 0;
     state.lastAnswerLatencyMs = null;
+    state.lastAnswerWasCorrect = null;
     state.isSubmittingAnswer = false;
+    state.stressBudget = STRESS_BUDGET_MAX;
+    state.interactionHesitationMs = 0;
+    state.interactionHesitationStartedAt = 0;
+    state.pointerPressureSamples = [];
+    state.deviceMovementIndex = 0;
+    state.lastAgitationEventAt = 0;
+    state.lastContextSwitchAt = 0;
+    state.lastRapidTapEventAt = 0;
+    state.interruptionLocks = {};
+    state.feedbackLastShownAt = 0;
+    state.feedbackPromptOpen = false;
+    state.feedbackResponseHistory = [];
+    state.feedbackDifficultyPreference = "medium";
+    state.feedbackTopicPreference = "";
+    state.lastFeedbackQuestionType = "";
+    clearInterestReelSchedule();
+    state.screenQuietUntil = 0;
+    state.newsReelHistory = [];
+    state.lastNewsTopic = "";
+    state.lastNewsImage = "";
     deactivateAllTriggers();
   }
 
@@ -2879,51 +3591,49 @@ const StressTriggers = (() => {
 
   function attachGlobalListeners() {
     ["click", "keydown", "scroll", "pointerdown"].forEach((eventName) => {
-      window.addEventListener(eventName, () => {
+      window.addEventListener(eventName, (evt) => {
         const idleBefore = Date.now() - state.lastInteractionAt;
-        markInteraction(eventName);
+        markInteraction(eventName, evt);
         if ((eventName === "click" || eventName === "keydown") && idleBefore > 9000) {
           requestTriggerFromAI("idle_resumed", { idle_before_ms: idleBefore });
         }
       }, { passive: true });
     });
 
-    if (!passiveMonitorTimer) {
-      passiveMonitorTimer = setInterval(() => {
-        if (state.stage !== "popups") return;
-        if (active.size >= 1) return;
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        state.lastContextSwitchAt = Date.now();
+        return;
+      }
+      if (!state.lastContextSwitchAt) return;
+      const hiddenMs = Math.max(0, Date.now() - state.lastContextSwitchAt);
+      state.lastContextSwitchAt = 0;
+      if (hiddenMs >= 1200) {
+        requestTriggerFromAI("context_switched", {
+          focus_lost_ms: hiddenMs,
+        });
+      }
+    });
 
-        const now = Date.now();
-        const userState = currentUserState();
-        const timeOnQuestion = Number(userState.timeOnQuestionMs || 0);
-        const idleMs = Number(userState.idleMs || 0);
-        const tooLong = Math.max(timeOnQuestion, idleMs) >= LONG_HESITATION_THRESHOLD_MS;
-        const waitGap = now - state.lastLongHesitationTriggerAt >= LONG_HESITATION_REPEAT_GAP_MS;
-        if (tooLong && waitGap) {
-          state.lastLongHesitationTriggerAt = now;
-          requestTriggerFromAI("long_hesitation", {
-            time_on_question_ms: timeOnQuestion,
-            idle_ms: idleMs,
-          });
-          return;
-        }
+    window.addEventListener("devicemotion", (evt) => {
+      const accel = evt?.accelerationIncludingGravity;
+      if (!accel) return;
+      const magnitude = Math.sqrt(
+        Math.pow(Number(accel.x || 0), 2) +
+        Math.pow(Number(accel.y || 0), 2) +
+        Math.pow(Number(accel.z || 0), 2)
+      );
+      const jitterIndex = Math.max(0, Math.min(10, (magnitude - 8) * 1.2));
+      updateDeviceMovement(jitterIndex);
+      if (state.deviceMovementIndex >= 6 && Date.now() - state.lastAgitationEventAt > 10000) {
+        state.lastAgitationEventAt = Date.now();
+        requestTriggerFromAI("device_agitation", {
+          device_movement_index: state.deviceMovementIndex,
+        });
+      }
+    }, { passive: true });
 
-        const ensureGap = now - state.lastEnsureActiveAt >= KEEPALIVE_GAP_MS;
-        if (ensureGap) {
-          state.lastEnsureActiveAt = now;
-          requestTriggerFromAI("ensure_active", {
-            time_on_question_ms: timeOnQuestion,
-            idle_ms: idleMs,
-          });
-        }
-
-        // Absolute watchdog: never let the UI stay trigger-idle for long.
-        const idleSince = state.lastTriggerEndedAt || state.lastAIDecisionAt || state.lastEnsureActiveAt || now;
-        if (now - idleSince > 3200 && active.size === 0) {
-          emergencyForceTrigger("watchdog");
-        }
-      }, 2200);
-    }
+    // Legacy auto-monitor loop removed intentionally.
   }
 
   return {
@@ -2932,11 +3642,16 @@ const StressTriggers = (() => {
     deactivateAllTriggers,
     isTriggerActive,
     canActivateTrigger,
+    isInterruptionActive,
+    isScreenBusyForPopup,
+    requestFeedbackPulse: showFeedbackPulse,
     evaluateUserState,
     setStage,
     onQuestionRendered,
     onOptionChange,
     onOptionHover,
+    onOptionPointerDown,
+    onOptionPointerUp,
     beginExamTimer,
     onPopupsEntered,
     beforeSubmitDelay,
@@ -2960,6 +3675,10 @@ function initSocket() {
   socket.on("connect", () => {
     $("wsStatus").textContent = "WS: connected";
     log("WS connected", socket.id);
+    if (sessionId) {
+      socket.emit("join_session", { session_id: sessionId });
+      logPopupEvent({ event: "join_session_reconnect", session_id: sessionId });
+    }
     logPopupEvent({ event: "connect", socket_id: socket.id });
   });
 
@@ -2981,6 +3700,10 @@ function initSocket() {
   socket.on("popup", (payload) => {
     log("popup event", payload);
     logPopupEvent({ event: "popup", payload });
+    if (!stageEls.popups?.classList.contains("active")) {
+      logPopupEvent({ event: "popup_ignored_not_in_test_stage" });
+      return;
+    }
     enqueuePopup(payload);
   });
 
@@ -3055,9 +3778,19 @@ function normalizePopupMessage(rawMessage) {
 }
 
 function enqueuePopup(payload) {
+  if (!stageEls.popups?.classList.contains("active")) return;
   if (!payload) return;
   const message = normalizePopupMessage(payload.message);
   if (!message) return;
+
+  // Keep all question prompts in the feedback system only.
+  if (/\?\s*$/.test(message) || /^quick\s+check[- ]?in\b/i.test(message)) {
+    if (StressTriggers.requestFeedbackPulse) {
+      StressTriggers.requestFeedbackPulse("popup_question_redirect", message);
+    }
+    return;
+  }
+
   const safePayload = { ...payload, message };
   const parts = message
     .split("\n")
@@ -3091,6 +3824,15 @@ function enqueuePopup(payload) {
 
 function processPopupQueue() {
   if (popupActive || popupQueue.length === 0) return;
+  if (StressTriggers.isScreenBusyForPopup && StressTriggers.isScreenBusyForPopup()) {
+    if (!popupSuppressionTimer) {
+      popupSuppressionTimer = setTimeout(() => {
+        popupSuppressionTimer = null;
+        processPopupQueue();
+      }, 350);
+    }
+    return;
+  }
   popupActive = true;
   const payload = popupQueue.shift();
   showPopupCard(payload, () => {
@@ -3101,6 +3843,11 @@ function processPopupQueue() {
 
 function showPopupCard(payload, done) {
   if (!popupOverlay) {
+    done?.();
+    return;
+  }
+  if (StressTriggers.isScreenBusyForPopup && StressTriggers.isScreenBusyForPopup()) {
+    if (payload) popupQueue.unshift(payload);
     done?.();
     return;
   }
@@ -3220,6 +3967,15 @@ function renderTestQuestion() {
       wrapper.addEventListener("mouseenter", () => {
         StressTriggers.onOptionHover(wrapper);
       });
+      wrapper.addEventListener("pointerdown", (evt) => {
+        StressTriggers.onOptionPointerDown(wrapper, evt);
+      });
+      wrapper.addEventListener("pointerup", () => {
+        StressTriggers.onOptionPointerUp();
+      });
+      wrapper.addEventListener("pointercancel", () => {
+        StressTriggers.onOptionPointerUp();
+      });
 
       const body = document.createElement("div");
       const labelEl = document.createElement("div");
@@ -3300,20 +4056,29 @@ function shouldMutateQuestion(q) {
 
 function scheduleMutationsForQuestions() {
   clearMutationTimers();
+  if (mutationPaused) return;
+  const maxMutations = 4;
+  let scheduled = 0;
   testQuestions.forEach((q, idx) => {
+    if (scheduled >= maxMutations) return;
     if (!shouldMutateQuestion(q)) return;
-    const timerId = setTimeout(() => mutateQuestionAt(idx), 5000);
+    // Stagger mutations to avoid saturating OpenAI calls that also power triggers.
+    const delayMs = 7000 + (scheduled * 9000);
+    const timerId = setTimeout(() => mutateQuestionAt(idx), delayMs);
     mutationTimers.push(timerId);
+    scheduled += 1;
   });
 }
 
 async function mutateQuestionAt(index) {
+  if (mutationPaused) return;
   const q = testQuestions[index];
   if (!q || q.mutated || (q.meta && q.meta.mutated)) return;
   try {
     const res = await fetch(`/api/questions/mutate/${q.question_id}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || null }),
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.question) {
@@ -3521,39 +4286,33 @@ async function skipRemainingQuestions() {
 async function handleCompletion() {
   showStage("loading", "The devil is designing your pressure test…");
   try {
-    const data = await postJSON(`/session/${sessionId}/start-simulation`, {});
-    log("start_simulation", data);
-    popupSummary.textContent = `Popups scheduled: ${data.popups_scheduled}. Keep an eye on the center top.`;
-    try {
-      const summaryData = await getJSON(`/session/${sessionId}/summary`);
-      setSummary(summaryData.user_summary || {});
-      log("session_summary", summaryData);
-    } catch (summaryErr) {
-      log("summary_error", summaryErr.message || String(summaryErr));
-    }
-    try {
-      const debugData = await getJSON(`/session/${sessionId}/debug`);
-      const history = (debugData.meta && debugData.meta.binary_answers) || [];
-      window.__binaryAnswers = Array.isArray(history) ? history : [];
-      setBinaryHistory(window.__binaryAnswers);
-    } catch (historyErr) {
-      log("binary_history_error", historyErr.message || String(historyErr));
-    }
+    popupSummary.textContent = "Pressure simulation is ready. Accept challenge to begin.";
   } catch (err) {
     log("simulation_error", err.message);
-    popupSummary.textContent = err.message;
   }
   await loadTestQuestions();
   await buildDevilBriefPage();
   showStage("devil");
 }
 
-function acceptDevilChallenge() {
+async function acceptDevilChallenge() {
+  if (!sessionId) return;
   if (devilHint) devilHint.textContent = "Challenge accepted. Entering test arena...";
+  if (btnAcceptChallenge) btnAcceptChallenge.disabled = true;
   StressTriggers.beginExamTimer();
   showStage("popups");
-  startBinaryPromptLoop();
+
+  try {
+    const data = await postJSON(`/session/${sessionId}/start-simulation`, {});
+    log("start_simulation", data);
+    popupSummary.textContent = "Pressure simulation is live. Keep your focus.";
+  } catch (err) {
+    log("simulation_error", err.message || String(err));
+    popupSummary.textContent = "Could not start popup simulation.";
+  }
+
   StressTriggers.onPopupsEntered();
+  if (btnAcceptChallenge) btnAcceptChallenge.disabled = false;
 }
 
 // HUD ----------------------------------------------------------------------
@@ -3600,8 +4359,6 @@ btnPrevQuestion?.addEventListener("click", () => gotoQuestion(-1));
 btnNextQuestion?.addEventListener("click", () => gotoQuestion(1));
 btnReloadQuestions?.addEventListener("click", () => loadTestQuestions());
 btnSubmitQuestion?.addEventListener("click", submitCurrentQuestion);
-btnBinaryA?.addEventListener("click", () => submitBinaryPrompt("A"));
-btnBinaryB?.addEventListener("click", () => submitBinaryPrompt("B"));
 
 // Live suggestions for initial text ---------------------------------------
 function setSuggestions(items) {

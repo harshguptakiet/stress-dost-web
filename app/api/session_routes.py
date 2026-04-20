@@ -1,12 +1,14 @@
 """Session routes."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import re
+
 from flask import Blueprint, current_app, jsonify, request
 
 from ..db.repo import create_session, get_session, save_session
 from ..extensions import socketio
 from ..realtime.scheduler import start_popup_simulation
-from ..services.binary_question_generator import generate_binary_question
 from ..services.combo_answer_parser import PARSERS as COMBO_PARSERS
 from ..services.combo_question_generator import generate_combo_question
 from ..services.combo_specs import COMBO_SPECS
@@ -39,11 +41,208 @@ from ..services.slot_manager import (
 )
 from ..services.slot_prefill_llm import prefill_slots_with_llm, update_state_with_user_reply
 from ..services.slot_prefill_schema import SessionState
-from ..services.user_summary import generate_user_summary
 from ..services.relevance import combo_relevant, domain_relevant
 from ..services.stop_engine import should_stop
+from ..services.user_summary import generate_user_summary
 
 bp = Blueprint("session", __name__, url_prefix="/session")
+
+
+def _mentions_person_text(text: str) -> bool:
+    lowered = (text or "").lower()
+    return bool(
+        re.search(
+            r"\b(friend|friends|teacher|sir|maam|mam|parent|parents|mother|father|mom|dad|brother|sister|classmate|roommate|boyfriend|girlfriend|partner|cousin|person|someone)\b",
+            lowered,
+        )
+    )
+
+
+def _has_explicit_person_name_text(text: str) -> bool:
+    """Return True when user text already includes explicit related-person identity."""
+    raw_text = (text or "")
+    lowered = raw_text.lower()
+    relation = r"(?:friend|friends|teacher|sir|maam|mam|parent|parents|mother|father|mom|dad|brother|sister|classmate|roommate|boyfriend|girlfriend|partner|cousin|person|someone)"
+
+    direct_patterns = [
+        rf"\b{relation}\b[^.?!\n]{{0,40}}\b(?:name\s+is|named|called)\s+[a-z][a-z'\-]{{1,30}}\b",
+    ]
+    if any(re.search(pattern, lowered) for pattern in direct_patterns):
+        return True
+
+    relation_tokens = {
+        "friend", "friends", "teacher", "sir", "maam", "mam", "parent", "parents",
+        "mother", "father", "mom", "dad", "brother", "sister", "classmate", "roommate",
+        "boyfriend", "girlfriend", "partner", "cousin", "person", "someone",
+    }
+    stop_tokens = {
+        "is", "am", "are", "was", "were", "be", "been", "being", "the", "a", "an",
+        "my", "your", "our", "his", "her", "their", "this", "that", "these", "those",
+        "very", "too", "so", "bad", "good", "nice", "mean", "strict", "rude", "compare",
+        "compares", "comparing", "keeps", "keep", "karta", "karti", "karte", "hai", "ho",
+        "with", "and", "or", "to", "of", "for", "in", "on",
+    }
+    tokens = re.findall(r"[A-Za-z][A-Za-z'\-]*", lowered)
+    for idx in range(len(tokens) - 1):
+        if tokens[idx] in relation_tokens:
+            nxt = tokens[idx + 1]
+            if nxt not in stop_tokens and len(nxt) >= 3:
+                return True
+    return False
+
+
+def _asks_for_name_text(question: str) -> bool:
+    return bool(re.search(r"\bname\b", (question or "").lower()))
+
+
+def _forced_name_question(text: str) -> str:
+    lowered = (text or "").lower()
+    if re.search(r"\bteacher\b|\bsir\b|\bmaam\b|\bmam\b", lowered):
+        return "Which teacher exactly are you talking about and what is their name?"
+    if re.search(r"\bfriends?\b", lowered):
+        return "Which friend exactly are you talking about and what is their name?"
+    if re.search(r"\bmother\b|\bfather\b|\bmom\b|\bdad\b|\bparent\b|\bparents\b|\bbrother\b|\bsister\b|\bcousin\b", lowered):
+        return "Which family member are you talking about and what is their name?"
+    return "Who exactly are you talking about and what is this person's name?"
+
+
+def _append_name_to_followup(existing_followup: str, latest_text: str) -> str:
+    """Preserve contextual follow-up and append person-name requirement."""
+    question = " ".join((existing_followup or "").strip().split())
+    if not question:
+        return _forced_name_question(latest_text)
+    if _asks_for_name_text(question):
+        return question
+
+    if question.endswith("?"):
+        question = question[:-1].rstrip()
+
+    name_part = _forced_name_question(latest_text)
+    if name_part.endswith("?"):
+        name_part = name_part[:-1].rstrip()
+
+    return f"{question}, and {name_part.lower()}?"
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _clamp01(value, default: float = 0.0) -> float:
+    num = _safe_float(value, default)
+    if num < 0:
+        return 0.0
+    if num > 1:
+        return 1.0
+    return num
+
+
+def _normalize_feedback_metric(raw: dict | None) -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "time_spent": _safe_float(raw.get("time_spent"), 0.0),
+        "confidence": _clamp01(raw.get("confidence"), 0.0),
+        "accuracy": bool(raw.get("accuracy", False)),
+    }
+
+
+def _impact_from_metrics(pre: dict, post: dict) -> str:
+    # Lower time_spent is better; higher confidence and accuracy are better.
+    degrade_count = 0
+    improve_count = 0
+
+    if post.get("time_spent", 0.0) > pre.get("time_spent", 0.0):
+        degrade_count += 1
+    elif post.get("time_spent", 0.0) < pre.get("time_spent", 0.0):
+        improve_count += 1
+
+    if post.get("confidence", 0.0) < pre.get("confidence", 0.0):
+        degrade_count += 1
+    elif post.get("confidence", 0.0) > pre.get("confidence", 0.0):
+        improve_count += 1
+
+    if bool(post.get("accuracy", False)) != bool(pre.get("accuracy", False)):
+        if bool(post.get("accuracy", False)):
+            improve_count += 1
+        else:
+            degrade_count += 1
+
+    if degrade_count == 3:
+        return "STRONG_NEGATIVE"
+    if degrade_count >= 2:
+        return "NEGATIVE"
+    if improve_count >= 2:
+        return "POSITIVE"
+    return "NEUTRAL"
+
+
+def _score_from_impact(impact: str) -> float:
+    if impact == "STRONG_NEGATIVE":
+        return -2.0
+    if impact == "NEGATIVE":
+        return -1.0
+    if impact == "POSITIVE":
+        return 1.0
+    return 0.0
+
+
+def _effectiveness_level(avg_score: float) -> str:
+    if avg_score <= -0.5:
+        return "low"
+    if avg_score >= 0.5:
+        return "high"
+    return "medium"
+
+
+def _safe_metric_ratio(numerator: float, denominator: float, default: float = 1.0) -> float:
+    if denominator <= 0:
+        return default
+    return max(0.0, numerator / denominator)
+
+
+def _build_baseline_metrics(stats: dict | None) -> dict:
+    stats = stats if isinstance(stats, dict) else {}
+    count = max(1, int(stats.get("count") or 0))
+    avg_time = _safe_float(stats.get("sum_time"), 0.0) / count
+    avg_confidence = _clamp01(_safe_float(stats.get("sum_confidence"), 0.0) / count, 0.0)
+    avg_accuracy = _clamp01(_safe_float(stats.get("sum_accuracy"), 0.0) / count, 0.0)
+    return {
+        "time_spent": avg_time,
+        "confidence": avg_confidence,
+        "accuracy": avg_accuracy,
+    }
+
+
+def _recovery_band(recovery_score: float) -> str:
+    if recovery_score >= 0.95:
+        return "fast"
+    if recovery_score >= 0.80:
+        return "moderate"
+    return "slow"
+
+
+def _recovery_effectiveness_score(recovery_score: float) -> float:
+    if recovery_score >= 0.95:
+        return -0.5
+    if recovery_score >= 0.80:
+        return 0.5
+    return 1.0
+
+
+def _compute_recovery_score(baseline_metrics: dict, recovery_metrics: dict) -> float:
+    baseline_time = max(1.0, _safe_float(baseline_metrics.get("time_spent"), 1.0))
+    baseline_accuracy = _clamp01(baseline_metrics.get("accuracy"), 0.5)
+
+    recovery_time = max(1.0, _safe_float(recovery_metrics.get("time_spent"), baseline_time))
+    recovery_accuracy = _clamp01(recovery_metrics.get("accuracy"), baseline_accuracy)
+
+    accuracy_ratio = _safe_metric_ratio(recovery_accuracy, max(0.01, baseline_accuracy), 1.0)
+    speed_ratio = _safe_metric_ratio(baseline_time, recovery_time, 1.0)
+    score = (0.6 * accuracy_ratio) + (0.4 * speed_ratio)
+    return max(0.0, min(1.5, score))
 
 
 @bp.post("/transcribe")
@@ -280,15 +479,37 @@ def next_question(session_id: str):
     followup_count = get_followup_count(session_id)
     followups_exhausted = bool(meta.get("followups_exhausted", False))
 
+    user_texts = [
+        str(item.get("text") or item.get("content") or "").strip()
+        for item in (session.history or [])
+        if isinstance(item, dict) and item.get("role") == "user"
+    ]
+    user_texts = [text for text in user_texts if text]
+
+    latest_user_text = user_texts[-1] if user_texts else ""
+    if not latest_user_text:
+        latest_user_text = session.raw_initial_text or ""
+
+    name_already_known = any(_has_explicit_person_name_text(text) for text in user_texts)
+
     if not client_followups_done and not followups_exhausted and not followup_limit_reached(followup_count):
         followup = generate_next_followup(
-            user_text=session.raw_initial_text or "",
+            user_text=latest_user_text,
             asked_questions=asked_questions,
             conversation_history=session.history or [],
             followup_count=followup_count,
             initial_text=session.raw_initial_text or "",
             session_id=session_id,
         )
+
+        if (
+            followup
+            and _mentions_person_text(latest_user_text)
+            and not name_already_known
+            and not _asks_for_name_text(followup)
+        ):
+            current_app.logger.info("next_question: appending name requirement at route-level session=%s", session_id)
+            followup = _append_name_to_followup(followup, latest_user_text)
 
         if followup:
             new_count = increment_followup_count(session_id)
@@ -560,7 +781,6 @@ def debug_session(session_id: str):
             "popups_count": len(session.popups or []),
             "popups": session.popups or [],
             "filled_slots": session.filled_slots,
-            "user_summary": (session.meta or {}).get("user_summary") or {},
             "meta": session.meta,
         }
     )
@@ -579,70 +799,6 @@ def session_summary(session_id: str):
             "user_summary": meta.get("user_summary") or {},
         }
     )
-
-
-@bp.post("/<session_id>/binary-question")
-def binary_question(session_id: str):
-    session = get_session(session_id)
-    if not session or session.status != "completed":
-        return jsonify({"error": "session not completed"}), 400
-
-    meta = dict(session.meta or {})
-    current_binary = meta.get("current_binary_question") or {}
-    if current_binary.get("question") and current_binary.get("a") and current_binary.get("b"):
-        return jsonify({"ok": True, "pending": True, **current_binary})
-
-    previous_answers = [item for item in (meta.get("binary_answers") or []) if isinstance(item, dict)]
-    previous_questions = [str(item.get("question") or "") for item in previous_answers if item.get("question")]
-    summary = meta.get("user_summary") or {}
-
-    question_data = generate_binary_question(
-        session.raw_initial_text or "",
-        user_summary=summary,
-        conversation_history=session.history or [],
-        previous_questions=previous_questions,
-        previous_answers=previous_answers,
-    )
-
-    meta["current_binary_question"] = question_data
-    session.meta = meta
-    save_session(session)
-    return jsonify({"ok": True, "pending": False, **question_data})
-
-
-@bp.post("/<session_id>/binary-answer")
-def binary_answer(session_id: str):
-    session = get_session(session_id)
-    if not session or session.status != "completed":
-        return jsonify({"error": "session not completed"}), 400
-
-    meta = dict(session.meta or {})
-    current_binary = meta.get("current_binary_question") or {}
-    if not current_binary.get("question"):
-        return jsonify({"error": "no active binary question"}), 400
-
-    body = request.get_json(force=True, silent=True) or {}
-    selected = str(body.get("selected") or "").strip().upper()
-    if selected not in {"A", "B"}:
-        return jsonify({"error": "selected must be 'A' or 'B'"}), 400
-
-    selected_text = current_binary.get("a") if selected == "A" else current_binary.get("b")
-    answers = [item for item in (meta.get("binary_answers") or []) if isinstance(item, dict)]
-    stored = {
-        "question": current_binary.get("question"),
-        "a": current_binary.get("a"),
-        "b": current_binary.get("b"),
-        "selected": selected,
-        "selected_text": selected_text,
-    }
-    answers.append(stored)
-    meta["binary_answers"] = answers
-    meta["current_binary_question"] = None
-    session.meta = meta
-    save_session(session)
-    return jsonify({"ok": True, "stored": stored, "answers_count": len(answers)})
-
-
 @bp.post("/<session_id>/complete")
 def complete_session_early(session_id: str):
     """Mark session as completed early when user skips remaining questions."""
@@ -693,8 +849,36 @@ def start_simulation(session_id: str):
     if not session or session.status != "completed":
         return jsonify({"error": "session not completed"}), 400
 
-    start_popup_simulation(session_id, session.popups or [])
-    return jsonify({"ok": True, "popups_scheduled": len(session.popups or [])})
+    popups = list(session.popups or [])
+    if not popups:
+        meta = dict(session.meta or {})
+        stress_profile = session.filled_slots or {}
+        stress_profile["__raw_text__"] = session.raw_initial_text or ""
+        clarifier_answers = meta.get("clarifier_answers")
+        if clarifier_answers:
+            stress_profile["__clarifiers__"] = clarifier_answers
+
+        inferred_signals = infer_emotion_signals(stress_profile)
+        stored_signals = meta.get("emotion_signals") or []
+        emotion_signals = list(dict.fromkeys(stored_signals + inferred_signals))
+
+        popups = generate_popups(stress_profile, emotion_signals)
+        session.popups = popups
+        meta["popups_ready"] = True
+        session.meta = meta
+        save_session(session)
+
+    max_popups = max(1, min(200, int(current_app.config.get("SIM_MAX_POPUPS", 18))))
+    scheduled = popups[:max_popups]
+
+    start_popup_simulation(session_id, scheduled)
+    return jsonify(
+        {
+            "ok": True,
+            "popups_scheduled": len(scheduled),
+            "popups_total": len(popups),
+        }
+    )
 
 
 @bp.post("/<session_id>/test-popup")
@@ -710,6 +894,126 @@ def test_popup(session_id: str):
     }
     socketio.emit("popup", payload, room=str(session_id))
     return jsonify({"ok": True, "sent": True, "payload": payload})
+
+
+@bp.post("/<session_id>/trigger-feedback")
+def persist_trigger_feedback(session_id: str):
+    session = get_session(session_id)
+    if not session:
+        return jsonify({"error": "session not found"}), 404
+
+    body = request.get_json(force=True, silent=True) or {}
+    trigger_name = str(body.get("trigger") or body.get("trigger_name") or "").strip()
+    if not trigger_name:
+        return jsonify({"error": "trigger is required"}), 400
+
+    intensity = str(body.get("intensity") or "low").strip().lower()
+    if intensity not in {"low", "medium", "high"}:
+        intensity = "low"
+
+    ts_raw = body.get("timestamp")
+    ts = int(ts_raw) if isinstance(ts_raw, (int, float)) else int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+
+    pre_metrics = _normalize_feedback_metric(body.get("pre_metrics"))
+    post_metrics = _normalize_feedback_metric(body.get("post_metrics"))
+    recovery_metrics = _normalize_feedback_metric(body.get("recovery_metrics") or body.get("post_60s_metrics"))
+    impact = _impact_from_metrics(pre_metrics, post_metrics)
+    impact_score = _score_from_impact(impact)
+
+    meta = dict(session.meta or {})
+    feedback = meta.get("trigger_feedback") if isinstance(meta.get("trigger_feedback"), dict) else {}
+    recent = [item for item in (feedback.get("recent_triggers") or []) if isinstance(item, dict)]
+    effectiveness = feedback.get("effectiveness") if isinstance(feedback.get("effectiveness"), dict) else {}
+
+    baseline_stats = feedback.get("baseline_stats") if isinstance(feedback.get("baseline_stats"), dict) else {}
+    baseline_count = int(baseline_stats.get("count") or 0) + 1
+    baseline_stats["count"] = baseline_count
+    baseline_stats["sum_time"] = _safe_float(baseline_stats.get("sum_time"), 0.0) + _safe_float(pre_metrics.get("time_spent"), 0.0)
+    baseline_stats["sum_confidence"] = _safe_float(baseline_stats.get("sum_confidence"), 0.0) + _clamp01(pre_metrics.get("confidence"), 0.0)
+    baseline_stats["sum_accuracy"] = _safe_float(baseline_stats.get("sum_accuracy"), 0.0) + (1.0 if bool(pre_metrics.get("accuracy")) else 0.0)
+
+    baseline_metrics = _build_baseline_metrics(baseline_stats)
+    if body.get("baseline_metrics") and isinstance(body.get("baseline_metrics"), dict):
+        incoming_baseline = body.get("baseline_metrics")
+        baseline_metrics = {
+            "time_spent": _safe_float(incoming_baseline.get("time_spent"), baseline_metrics.get("time_spent", 0.0)),
+            "confidence": _clamp01(incoming_baseline.get("confidence"), baseline_metrics.get("confidence", 0.0)),
+            "accuracy": _clamp01(incoming_baseline.get("accuracy"), baseline_metrics.get("accuracy", 0.0)),
+        }
+
+    recovery_source = recovery_metrics if body.get("recovery_metrics") or body.get("post_60s_metrics") else post_metrics
+    recovery_score = _compute_recovery_score(baseline_metrics, recovery_source)
+    recovery_band = _recovery_band(recovery_score)
+    impact_score += _recovery_effectiveness_score(recovery_score)
+
+    stored = {
+        "trigger": trigger_name,
+        "intensity": intensity,
+        "timestamp": ts,
+        "pre_metrics": pre_metrics,
+        "post_metrics": post_metrics,
+        "recovery_metrics": recovery_source,
+        "baseline_metrics": baseline_metrics,
+        "recovery_score": recovery_score,
+        "recovery_band": recovery_band,
+        "impact": impact,
+    }
+    recent.append(stored)
+    feedback["recent_triggers"] = recent[-30:]
+    feedback["baseline_stats"] = baseline_stats
+    feedback["baseline_metrics"] = baseline_metrics
+
+    trigger_stats = effectiveness.get(trigger_name) if isinstance(effectiveness.get(trigger_name), dict) else {}
+    count = int(trigger_stats.get("count") or 0) + 1
+    total_score = _safe_float(trigger_stats.get("total_score"), 0.0) + impact_score
+    avg_score = total_score / max(1, count)
+    avg_recovery = (
+        (_safe_float(trigger_stats.get("avg_recovery"), recovery_score) * max(0, count - 1)) + recovery_score
+    ) / max(1, count)
+    effectiveness[trigger_name] = {
+        "count": count,
+        "total_score": total_score,
+        "avg_score": avg_score,
+        "avg_recovery": avg_recovery,
+        "last_recovery_score": recovery_score,
+        "last_recovery_band": recovery_band,
+        "level": _effectiveness_level(avg_score),
+        "last_impact": impact,
+        "last_intensity": intensity,
+        "last_timestamp": ts,
+    }
+    feedback["effectiveness"] = effectiveness
+
+    meta["trigger_feedback"] = feedback
+    session.meta = meta
+    save_session(session)
+
+    return jsonify(
+        {
+            "ok": True,
+            "stored": stored,
+            "trigger_effectiveness": effectiveness.get(trigger_name) or {},
+            "recent_count": len(feedback.get("recent_triggers") or []),
+        }
+    )
+
+
+@bp.get("/<session_id>/trigger-feedback")
+def get_trigger_feedback(session_id: str):
+    session = get_session(session_id)
+    if not session:
+        return jsonify({"error": "session not found"}), 404
+
+    meta = dict(session.meta or {})
+    feedback = meta.get("trigger_feedback") if isinstance(meta.get("trigger_feedback"), dict) else {}
+    return jsonify(
+        {
+            "ok": True,
+            "session_id": str(session.id),
+            "recent_triggers": feedback.get("recent_triggers") or [],
+            "effectiveness": feedback.get("effectiveness") or {},
+        }
+    )
 
 
 
@@ -732,9 +1036,11 @@ def _complete_session(session):
         conversation_history=session.history or [],
         emotion_signals=emotion_signals,
     )
+    meta["popups_ready"] = False
     session.meta = meta
-    popups = generate_popups(stress_profile, emotion_signals)
-    session.popups = popups
+    # Popups are generated lazily in /start-simulation so test-question
+    # generation is not contending with popup generation.
+    session.popups = []
 
     # Clean up runtime follow-up counter
     reset_followup_count(str(session.id))
@@ -744,9 +1050,8 @@ def _complete_session(session):
         {
             "done": True,
             "status": session.status,
-            "popups_ready": True,
+            "popups_ready": False,
             "popups_count": len(session.popups or []),
             "filled_slots": session.filled_slots,
-            "user_summary": meta.get("user_summary") or {},
         }
     )

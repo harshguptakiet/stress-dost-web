@@ -4,6 +4,7 @@ from __future__ import annotations
 from openai import OpenAI
 
 client = OpenAI()
+client_no_retry = OpenAI(max_retries=0)
 
 
 def chat_text(model: str, system: str, user: str, **kwargs):
@@ -32,6 +33,20 @@ def chat_json(model: str, system: str, user: str, **kwargs):
     return client.chat.completions.create(**options)
 
 
+def chat_json_no_retry(model: str, system: str, user: str, **kwargs):
+    """Latency-critical JSON chat completion with SDK retries disabled."""
+    options = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    options.update(kwargs)
+    return client_no_retry.chat.completions.create(**options)
+
+
 def transcribe_audio(file_storage, model: str = "gpt-4o-mini-transcribe") -> str:
     """Transcribe an uploaded audio file and return plain text."""
     filename = getattr(file_storage, "filename", None) or "recording.webm"
@@ -48,4 +63,4 @@ def transcribe_audio(file_storage, model: str = "gpt-4o-mini-transcribe") -> str
     return text.strip()
 
 
-__all__ = ["chat_text", "chat_json", "transcribe_audio"]
+__all__ = ["chat_text", "chat_json", "chat_json_no_retry", "transcribe_audio"]
