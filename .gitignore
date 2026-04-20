@@ -1,4 +1,17 @@
 venv/
+.venv/
 .env
 __pycache__/
 *.pyc
+instance/
+data/
+migrations/versions/
+.vscode/
+*.log
+*.db
+*.sqlite3
+*.pkl
+*.bak
+*.swp
+Thumbs.db
+.DS_Store
